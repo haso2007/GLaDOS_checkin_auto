@@ -257,7 +257,7 @@ if __name__ == '__main__':
         in_exchange_window = (
             auto_exchange
             and left_days_float is not None
-            and 0 < left_days_float <= exchange_window_days
+            and 0 <= left_days_float <= exchange_window_days
         )
         if in_exchange_window and plan_type is None and isinstance(points_value, int):
             need = 100 - points_value
@@ -291,7 +291,7 @@ if __name__ == '__main__':
             print(email+'----exchange '+exchange_label+'--'+exchange_msg)
             sendContent += email+'----exchange '+exchange_label+'--'+exchange_msg+'\n'
         elif auto_exchange and plan_type is not None:
-            print(f"{email}----skip exchange: leftDays={left_days_float} (raw={left_days}), need 0<leftDays<={exchange_window_days}")
+            print(f"{email}----skip exchange: leftDays={left_days_float} (raw={left_days}), need 0<=leftDays<={exchange_window_days}")
      #--------------------------------------------------------------------------------------------------------#   
     if sckey != "":
          requests.get('http://www.pushplus.plus/send?token=' + sckey + '&title='+email+'签到成功'+'&content='+sendContent)
