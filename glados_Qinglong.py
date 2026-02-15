@@ -177,6 +177,11 @@ def start():
         'token': 'glados.cloud'
     }
     auto_exchange = os.environ.get("AUTO_EXCHANGE", os.environ.get("AUTO_EXCHANGE_200", "1")).lower() not in ("0", "false", "no")
+    # Exchange when remaining days are within this window (default: last 1 day).
+    try:
+        exchange_window_days = float(os.environ.get("AUTO_EXCHANGE_LEFT_DAYS", "1"))
+    except Exception:
+        exchange_window_days = 1.0
     for cookie in cookies:
         headers = {'cookie': cookie ,'referer': referer,'origin':origin,'user-agent':useragent}
         checkin = requests.post(url,headers={**headers,'content-type':'application/json;charset=UTF-8'},data=json.dumps(payload))
@@ -201,10 +206,13 @@ def start():
             continue
 
         time = str(left_days).split('.')[0]
+        left_days_float = None
         left_days_value = None
         try:
-            left_days_value = int(float(left_days))
+            left_days_float = float(left_days)
+            left_days_value = int(left_days_float)
         except Exception:
+            left_days_float = None
             left_days_value = None
 
         mess = None
@@ -244,7 +252,17 @@ def start():
 
         plan_type, exchange_label = _plan_type_for_points(points_value)
         print(f"{email}----当前总积分: {points_value}----可兑换额度: {exchange_label}")
-        if auto_exchange and left_days_value == 1 and plan_type is not None:
+        in_exchange_window = (
+            auto_exchange
+            and left_days_float is not None
+            and 0 < left_days_float <= exchange_window_days
+        )
+        if in_exchange_window and plan_type is None and isinstance(points_value, int):
+            need = 100 - points_value
+            if need > 0:
+                print(f"{email}----exchange pending: leftDays={left_days_float} (raw={left_days}), needPoints={need} to reach 100")
+        should_exchange = in_exchange_window and plan_type is not None
+        if should_exchange:
             exchange_payload = {'planType': plan_type}
             exchange_msg = None
             exchange_status = None
@@ -270,6 +288,8 @@ def start():
                 exchange_msg = f"{exchange_msg} ({detail})"
             print(email+'----exchange '+exchange_label+'--'+exchange_msg)
             sendContent += email+'----exchange '+exchange_label+'--'+exchange_msg+'\n'
+        elif auto_exchange and plan_type is not None:
+            print(f"{email}----skip exchange: leftDays={left_days_float} (raw={left_days}), need 0<leftDays<={exchange_window_days}")
      #--------------------------------------------------------------------------------------------------------#
     if sckey != "":
         requests.get('http://www.pushplus.plus/send?token=' + sckey + '&title='+email+'签到成功'+'&content='+sendContent)
