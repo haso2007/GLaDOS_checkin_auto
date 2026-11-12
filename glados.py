@@ -236,6 +236,32 @@ def left_days(data: Optional[dict]) -> Optional[int]:
     return days
 
 
+def account_name(data: Optional[dict]) -> str:
+    """从状态响应中尽量提取账号名称，优先使用邮箱。"""
+    if not isinstance(data, dict):
+        return ""
+
+    def _value(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.split())[:120]
+
+    def _find(payload: Dict[str, Any]) -> str:
+        for key in ("email", "mail", "username", "userName", "account", "name", "nickname"):
+            value = _value(payload.get(key))
+            if value:
+                return value
+        for key in ("user", "profile", "account", "userInfo", "data"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                value = _find(nested)
+                if value:
+                    return value
+        return ""
+
+    return _find(data)
+
+
 def normalize_origin(raw: str) -> str:
     """把 origin 归一化为纯主机名（小写、去协议/路径/端口）。
 
@@ -382,8 +408,13 @@ class CookieEntry:
 
     @property
     def label(self) -> str:
-        """日志标识：自起名显示「1:主号」，未起名显示「账号1」"""
-        return f"{self.index}:{self.name}" if self.is_named else (self.name or f"账号{self.index}")
+        """日志标识：优先显示配置或状态响应中的账号名。"""
+        return self.name or f"账号{self.index}"
+
+    def update_name(self, name: str) -> None:
+        """未配置名称时，以服务端状态返回的账号名替代默认编号。"""
+        if not self.is_named and name:
+            self.name = name
 
     def log(self, domain: str, emoji: str, message: str, force: bool = False) -> None:
         """带账号与域名前缀的日志"""
@@ -502,7 +533,7 @@ class CookieEntry:
         if days < 0:
             return f"已过期 {abs(days)} 天，请及时续期"
         if days <= EXPIRY_WARN_DAYS:
-            return f"仅剩 {days} 天，建议及时续期或配置自动兑换"
+            return f"仅剩 {days} 天，请留意到期；进入最后一天将自动按积分兑换最大档位"
         return ""
 
     def _log_result(self) -> None:
@@ -547,6 +578,7 @@ class CookieEntry:
 
         code = data.get("code", -2)
         if code == 0 and isinstance(data.get("data"), dict):
+            self.update_name(account_name(data))
             return ProbeResult.HIT, left_days(data), code
         return ProbeResult.REJECTED, None, code
 
@@ -1193,8 +1225,6 @@ class Config:
         self._load_auto_exchange()
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.accounts)} 个账号用于签到。")
-        for account in self.accounts:
-            logger.info(f"{LogEmoji.INFO} {LogEmoji.COOKIE}[{account.label}] {LogEmoji.DOMAIN}[{account.origin or '待探测'}] UA={'自定义' if account.user_agent else '默认'}")
         logger.info(f"{LogEmoji.INFO} 自动兑换 {self.ENV_AUTO_EXCHANGE}: {self.auto_exchange} (最后期限窗口: <= {self.exchange_window_days} 天)。")
         logger.info(f"{LogEmoji.INFO} 详细日志 {self.ENV_VERBOSE}: {self.verbose}。")
 

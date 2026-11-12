@@ -43,7 +43,7 @@
 ]
 ```
 
-- **允许字段**：`name`（备注名，可选）、`origin`（站点域名，可选，不填自动探测）、`cookie`（完整 Cookie，必填）、`user-agent`（提取 Cookie 时的浏览器 UA，可选，建议填写）。
+- **允许字段**：`name`（备注名，可选，建议填邮箱以便日志直接显示账号名）、`origin`（站点域名，可选，不填自动探测）、`cookie`（完整 Cookie，必填）、`user-agent`（提取 Cookie 时的浏览器 UA，可选，建议填写）。
 - **Cookie 要求**：必须包含登录会话字段（`koa:sess=` 或 `gld:sess=`）。
 - **重复去重**：同一 Cookie 自动去重，避免重复签到。
 
