@@ -1,0 +1,41 @@
+services:
+  glados-checkin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Build downloads only. Runtime browser sessions keep their per-account proxy isolation.
+      args:
+        HTTP_PROXY: ${GLADOS_BUILD_PROXY:-http://172.17.0.1:5890}
+        HTTPS_PROXY: ${GLADOS_BUILD_PROXY:-http://172.17.0.1:5890}
+        NO_PROXY: localhost,127.0.0.1,::1,host.docker.internal
+    image: glados-browser-checkin:local
+    container_name: glados-checkin
+    init: true
+    restart: unless-stopped
+    ports:
+      # Reachable on all NAS network interfaces; secure the NAS LAN accordingly.
+      - "${GLADOS_WEB_BIND:-0.0.0.0}:${GLADOS_WEB_PORT:-8791}:8791"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      XVFB_SCREEN: ${XVFB_SCREEN:-1920x1080x24}
+      # Windows machine running local_browser.py. The container browser falls back here.
+      GLADOS_LOCAL_BROWSER_URL: ${GLADOS_LOCAL_BROWSER_URL:-http://192.168.1.114:8792}
+    volumes:
+      - ./data:/app/data
+      # Imported only on the first startup. After saving in the UI, data/config.json is authoritative.
+      - ./secret:/app/secret:ro
+      # Application code is bind-mounted so routine changes do not rebuild the large browser image.
+      - ./glados.py:/app/glados.py
+      - ./logging_config.py:/app/logging_config.py
+      - ./browser_env.py:/app/browser_env.py
+      - ./browser_checkin.py:/app/browser_checkin.py
+      - ./turnstile.py:/app/turnstile.py
+      - ./config_store.py:/app/config_store.py
+      - ./web_service.py:/app/web_service.py
+      - ./web:/app/web
+      - ./docker/entrypoint.sh:/app/docker/entrypoint.sh
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: ${GLADOS_SHM_SIZE:-1gb}
+    security_opt:
+      - seccomp=unconfined

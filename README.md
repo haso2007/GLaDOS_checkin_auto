@@ -66,10 +66,81 @@
 
 ---
 
-## GitHub Actions 部署
+## 容器浏览器签到（推荐）
+
+GLaDOS 的签到页面如被 Cloudflare 人机验证拦截，GitHub Actions 的纯 HTTP 请求无法完成验证。此仓库提供一个本地 Docker 服务：每个账号运行在独立的 Camoufox 浏览器 profile 中，并使用独立或轮换代理。Cloudflare 验证在真实浏览器内完成，`cf_clearance` 不会导出到 Python HTTP 客户端。
+
+### 启动
+
+```bash
+docker compose up -d --build
+```
+
+打开 [http://127.0.0.1:8791](http://127.0.0.1:8791)。页面默认只绑定本机回环地址，避免 Cookie 管理界面暴露到公网。
+
+首次启动时会导入以下可选本地文件；随后 UI 保存的 `data/config.json` 是唯一配置来源：
+
+- `secret/cookie_json`：**优先使用**的 JSON 账号数组；每项可填 `name`、`cookie`、`user-agent`，也可在网页中补充域名和专属代理。
+- `secret/cookie`：兼容旧格式 `&` 分隔 Cookie 或上文 JSON 格式；仅在不存在 `cookie_json` 时导入。
+- `secret/proxy`：每行一条代理，支持 `http://user:pass@host:port`、`user:pass@host:port`、`host:port:user:pass` 与 `host:port`。
+
+`secret/` 与 `data/` 已被 `.gitignore` 排除，**不要提交 Cookie、代理账号或 `data/config.json`**。
+
+### Web 管理
+
+- 默认显示一个账号卡片，通过 **＋ 添加账号** / **－ 删除** 管理账号；每张卡独立填写 Cookie、可选登录域名与专属代理。User-Agent 字段仅用于诊断；Camoufox 会管理与浏览器一致的指纹，避免手工覆写造成 Cloudflare 指纹不一致。
+- 未填写专属代理的账号按「公共代理池」轮换。代理失败不会回退到容器直接联网。
+- 可设置每天北京时间的自动签到开关与时间，也可以立即签到全部，或对单个账号点击「单独签到」。
+- 最终结果会显示签到状态、积分、剩余天数、兑换结果、出口 IP 和脱敏后的代理主机；实时日志不会显示 Cookie 或代理密码。
+
+容器使用有头 Camoufox + Xvfb，首次构建会下载浏览器，镜像较大且需要约 1 GB 共享内存。每个账号在运行结束后删除临时浏览器 profile。
+
+### 本机 Edge / Chrome 模式（GLaDOS Turnstile 兜底）
+
+如果 NAS 容器内的 Camoufox 无法取得 GLaDOS 的 Turnstile token，可在 Web 页面选择 **本地浏览器**，让 NAS 调用 Windows 电脑上的真实 Chromium 浏览器完成签到。NAS 不需要安装 Edge 或 Chrome；浏览器实际运行在 Windows 上。
+
+> **必须保持 Windows 本机服务运行。** 该模式下，Windows 电脑开机且 `local_browser.py` 正在运行，NAS 的手动/自动签到才能调用本机 Edge / Chrome。关闭终端、重启电脑或服务退出后，本地浏览器模式会失败。
+
+在 Windows 项目目录启动服务：
+
+```bash
+python local_browser.py
+```
+
+服务默认监听 `0.0.0.0:8792`，NAS 会访问 Windows 电脑的局域网地址。例如当前部署可用时：
+
+```text
+NAS:     http://192.168.1.120:8791
+Windows: http://192.168.1.114:8792/health
+```
+
+页面操作：
+
+1. 在“浏览器模式”选择 **本地浏览器**；
+2. 默认保持“本机浏览器沿用账号代理”**不勾选**，让 Edge / Chrome 走 Windows 的系统网络（例如 Clash TUN）；
+3. 点击 **保存配置**，手动、批量和定时签到都会直接调用本机浏览器；
+4. 单个账号也可点击账号卡片上的 **本机浏览器签到**，跳过 NAS 容器浏览器。
+
+本机服务会优先使用 Chrome，未安装 Chrome 时自动使用 Microsoft Edge。它会接收 NAS 发送的 Cookie 以注入临时/持久浏览器 profile，因此只应在可信局域网中开放 `8792`，并使用 NAS 防火墙限制访问来源。
+
+签到逻辑、Web API、页面和容器入口脚本通过 Compose 挂载进容器。修改这些文件后无需重新构建镜像，只需重新创建容器：
+
+```bash
+docker compose up -d --force-recreate --no-build
+```
+
+只有修改 `requirements.txt`、Dockerfile 中的系统依赖或 Camoufox 浏览器时，才需要执行 `docker compose up -d --build`。
+
+---
+
+## GitHub Actions 部署（不适用于 Cloudflare 人机验证）
+
+GitHub Actions 仍保留用于未被 Cloudflare 阻止的账号：
 
 1. Fork 本仓库。
 2. 在 Fork 的仓库进入 `Settings` -> `Secrets and variables` -> `Actions` -> `New repository secret`。
 3. 添加 `GLADOS_COOKIES`（填入上述 JSON 数组或 Cookie 内容）。
 4. 进入 `Actions` 标签页，启用工作流。
 5. 可以手动触发一次 `workflow_dispatch` 检验运行状态，每天定时自动执行。
+
+若 Action 日志出现 Cloudflare HTML / 人机验证页，请改用上方的本地容器服务。

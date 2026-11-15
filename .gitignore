@@ -11,10 +11,12 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Environment variables
+# Environment variables and local credentials
 .env
 .env.local
 .env.*.local
+secret/
+data/
 
 # Logs
 logs
@@ -24,3 +26,6 @@ logs
 build/
 dist/
 *.egg-info/
+
+# Claude Code local session files and generated worktrees
+.claude/

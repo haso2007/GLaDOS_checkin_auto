@@ -1,1 +1,5 @@
 requests>=2.31,<3
+camoufox[geoip]>=0.4.11
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx[socks]>=0.27
