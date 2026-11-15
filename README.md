@@ -1,28 +1,104 @@
-# GLaDOS 自动签到
+# GLaDOS 原生 Chromium 自动签到
 
-全自动每日签到脚本，与 GLaDOS 网页端最新签到机制完全对齐（支持 challenge/proof 验证、设备平台自适应、候选域名自动探测与最后一天按积分自动兑换最大天数）。
+此分支将 GLaDOS 每日签到、状态/积分查询、临期积分兑换、失败重试和定时任务运行在一台 Debian 云服务器上。每个账号都使用独立、一次性的 Chromium profile；页面签到、Cloudflare Turnstile、Cookie、状态和兑换请求保持在同一真实浏览器上下文内。
 
-支持 **GitHub Actions** 部署。
+> 当前分支：`feat/instabox-debian-native-chromium`
+>
+> 目标环境：Instabox Debian 13+、系统 Chromium、systemd。
+> 此分支**不使用 Docker**，也不包含 Windows Edge/Chrome 回退服务。
 
----
+## 安全与 Cloudflare 限制
 
-## 环境变量说明
+- 云服务器的 Chromium 不是绕过 Cloudflare 的方法。数据中心出口 IP、代理信誉、地理位置、Linux/无头浏览器特征或 Cookie 登录设备差异都可能使 Turnstile 无法通过。
+- 服务只点击 GLaDOS 自己的签到页面按钮并等待网页产生/提交验证结果；不会伪造、重放、导出或记录 Turnstile token，也不会调用打码服务。
+- 账号设置了专属代理、或使用公共代理池时，代理出口探测失败会使该代理尝试失败，**绝不静默改用云服务器直连 IP**。
+- 管理页面能读取和写入 Cookie、代理地址与代理密码。仅可通过你自行保护的 Cloudflare Tunnel/Access 发布，切勿直接公开端口。
+- Cookie、代理凭据、Turnstile token 和其他机密不得提交到 Git、写入日志或复制到应用发布目录。
 
-| 环境变量 | 必填 | 说明 |
-| --- | :---: | --- |
-| `GLADOS_COOKIES` / `GLADOS_COOKIE` | **是** | 账号 Cookie 配置，支持 JSON 数组（推荐）或旧版 `&` 分隔 |
-| `AUTO_EXCHANGE` | 否 | 账户在最后一天时自动用积分兑换最大可用天数（`true`/`1` 开启，默认开启） |
-| `AUTO_EXCHANGE_LEFT_DAYS` | 否 | 触发自动兑换的剩余天数阈值（默认 `1` 天，即 0 或 1 天时兑换） |
-| `GLADOS_BASE_URLS` | 否 | 自定义站点域名列表（逗号或分号分隔） |
-| `GLADOS_VERBOSE` | 否 | 是否输出详细日志（`true` / `1`） |
+## Instabox Debian 安装
 
----
+在 Instabox Web Terminal 中克隆已发布的分支：
 
-## Cookie 格式配置
+```bash
+git clone --branch feat/instabox-debian-native-chromium \
+  https://github.com/haso2007/GLaDOS_checkin_auto.git
+cd GLaDOS_checkin_auto
+sudo bash deploy/debian/setup.sh
+```
 
-### 推荐：JSON 数组格式
+安装脚本会：
 
-在 GitHub 仓库 Secrets 中配置 `GLADOS_COOKIES`（或 `GLADOS_COOKIE`）：
+1. 安装 Debian 的 `chromium`、Python venv、Xvfb、字体与必需工具；不会运行 `playwright install` 或下载 Playwright 自带浏览器。
+2. 创建无登录权限的 `glados` 系统用户。
+3. 将 root 所有的应用发布到 `/opt/glados-checkin`，将敏感且持久的数据保存在 `/var/lib/glados-checkin`。
+4. 安装 `glados-checkin.service`，默认只监听 `127.0.0.1:3000`。
+5. 在真实 systemd 服务环境中检查 HTTP readiness，并启动/关闭一个不访问网络、不带账号 Cookie 的 Chromium `about:blank` 自检。
+
+安装过程中会先构建并验证临时发布目录，再停止旧服务切换版本；失败时会恢复上一版。账号配置和日志目录不会因升级而删除。
+
+> 首次安装前，此分支必须已经提交并推送到远端；否则 `git clone --branch` 只能取得旧版本。
+
+## 服务管理与诊断
+
+```bash
+# 查看当前状态
+sudo systemctl status glados-checkin
+
+# 跟踪服务日志
+sudo journalctl -u glados-checkin -f
+
+# 标准 readiness：检查 API 与 Chromium 可执行文件
+curl -fsS http://127.0.0.1:3000/api/health
+
+# 深度本地 Chromium 自检：仅打开 about:blank，不会访问 GLaDOS
+curl -fsS 'http://127.0.0.1:3000/api/health?deep=true'
+
+# 重启服务
+sudo systemctl restart glados-checkin
+```
+
+服务环境文件位于 `/etc/glados-checkin/glados-checkin.env`：
+
+```bash
+WEB_HOST=127.0.0.1
+WEB_PORT=3000
+GLADOS_DATA_DIR=/var/lib/glados-checkin
+GLADOS_BROWSER_PROFILE_DIR=/var/lib/glados-checkin/profiles
+GLADOS_CHROMIUM_EXECUTABLE=
+```
+
+`WEB_HOST` 在此分支必须保持回环地址。若你的 Tunnel 无法转发 `127.0.0.1:3000`，请先明确网络和防火墙策略，再调整绑定地址；本仓库不会配置 Cloudflare Tunnel、域名、TLS 或外部认证。
+
+浏览器模式由 Web UI 保存的配置控制：
+
+- **无头**：默认的云端运行模式；
+- **有头（Xvfb）**：仅用于受控诊断。窗口只出现在服务的私有虚拟显示器中，不会开启 VNC、RDP、浏览器调试端口或显示 TCP 端口。
+
+服务保留 `NoNewPrivileges=true`，并依赖 Chromium 自己的沙箱；绝不应通过添加 `--no-sandbox` 来解决启动问题。若实际 Instabox systemd 日志证明该限制阻碍 Chromium 的受支持沙箱初始化，应先保留日志并单独评估最小化调整，而不是降低浏览器或文件权限安全性。
+
+## Web 管理与数据持久化
+
+打开你的受保护 Tunnel 地址后，在页面中：
+
+1. 通过“批量导入 Cookie”或账号卡片添加 Cookie；首次配置推荐使用 JSON 数组。
+2. 可为账号填写可选域名、专属代理，或在公共代理池逐行添加代理。
+3. 可选择 Chromium **无头**或**有头（Xvfb）**模式，设置自动兑换和北京时间每日定时签到。
+4. 可手动执行全部/单账号签到，并在结果持久化后重试失败账号。
+
+敏感配置和运行状态：
+
+```text
+/var/lib/glados-checkin/config.json
+/var/lib/glados-checkin/job_state.json
+/var/lib/glados-checkin/scheduler_state.json
+/var/lib/glados-checkin/logs/glados.log
+```
+
+目录归 `glados` 用户私有（`0700`），服务文件 `UMask=0077`。日志会脱敏常见 Cookie 和代理密码字段，历史日志上限为 10 MB。最新运行结果和每日调度 key 单独持久化：服务在同一分钟重启不会重复启动已接受的定时任务；若服务在签到过程中重启，界面会标记该任务中断，已保存的失败结果仍可用于重试。
+
+Cookie 与代理配置默认只经由 Web UI 写入私有数据目录。安装脚本有意不复制克隆目录中的 `secret/`、`data/`、`.env` 或 Git 元数据；不要把真实凭据放在应用目录或仓库中。
+
+### Cookie JSON 格式
 
 ```json
 [
@@ -30,117 +106,43 @@
     "name": "主号",
     "origin": "glados.cloud",
     "cookie": "koa:sess=...; koa:sess.sig=...; gld:sess=...",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
-  },
-  {
-    "name": "小号",
-    "origin": "railgun.info",
-    "cookie": "koa:sess=...; koa:sess.sig=..."
-  },
-  {
-    "cookie": "gld:sess=..."
+    "user-agent": "Mozilla/5.0 (...)"
   }
 ]
 ```
 
-- **允许字段**：`name`（备注名，可选，建议填邮箱以便日志直接显示账号名）、`origin`（站点域名，可选，不填自动探测）、`cookie`（完整 Cookie，必填）、`user-agent`（提取 Cookie 时的浏览器 UA，可选，建议填写）。
-- **Cookie 要求**：必须包含登录会话字段（`koa:sess=` 或 `gld:sess=`）。
-- **重复去重**：同一 Cookie 自动去重，避免重复签到。
+- `cookie` 必须包含 `koa:sess=` 或 `gld:sess=`。
+- `name`、`origin`、`user-agent` 可选；缺少域名时会探测候选 GLaDOS 域名。
+- `user-agent` 应是获取该 Cookie 时的浏览器 UA。原生 Chromium 会使用该请求 UA，但不会模拟完整的操作系统或浏览器指纹。
+- 支持旧版 `cookie1&cookie2` 格式。
+- 支持 `http://`、`https://` 代理及无认证的 `socks5://` 代理。认证 SOCKS 代理会被明确拒绝而不是协议篡改或直连回退。
 
-### 兼容格式：`&` 分隔
+## 自动兑换
 
-旧版格式 `cookie1&cookie2` 仍完全兼容支持，脚本运行时会自动识别并提示建议迁移为 JSON 数组。
+当剩余天数小于等于设定阈值（默认 `1` 天）时，服务会按积分兑换可用的最大档位：
 
----
+| 积分 | 兑换天数 | `planType` |
+| ---: | ---: | --- |
+| 500+ | 100 | `plan500` |
+| 200+ | 30 | `plan200` |
+| 100+ | 10 | `plan100` |
 
-## 签到与自动兑换机制
-
-1. **网页端协议对齐**：先请求 `/api/user/checkin/challenge` 获取动态 `nonce`，等待 2.5 秒后计算 SHA256 签名 `proof`，携带 `token`、`nonce`、`proof` 发起签到，确保获得完整签到奖励。
-2. **设备 UA 自适应**：如服务端返回 `device-mismatch` 错误，脚本会自动识别登录设备平台（Windows / macOS / Linux / iOS / Android）并自适应切换 User-Agent 重试。
-3. **域名自动探测**：内置候选域名池（`glados.cloud`, `railgun.info`, `glados.network`, `glados.rocks`, `glados.one`, `glados.space`, `glados.vip`, `glados-facility.com`），自动识别 Cookie 对应的登录站点。
-4. **最后一天自动兑换最大天数**：延续原项目核心逻辑，当账户剩余天数进入最后一天（剩余天数 <= 1 天）时，自动根据当前账户积分余额兑换最大可用档位：
-   - 500+ 积分：兑换 100 天 (`plan500`, 500->100 days)
-   - 200+ 积分：兑换 30 天 (`plan200`, 200->30 days)
-   - 100+ 积分：兑换 10 天 (`plan100`, 100->10 days)
-   - 低于 100 积分：日志提示当前积分与差额，等待积分满足。
-
----
-
-## 容器浏览器签到（推荐）
-
-GLaDOS 的签到页面如被 Cloudflare 人机验证拦截，GitHub Actions 的纯 HTTP 请求无法完成验证。此仓库提供一个本地 Docker 服务：每个账号运行在独立的 Camoufox 浏览器 profile 中，并使用独立或轮换代理。Cloudflare 验证在真实浏览器内完成，`cf_clearance` 不会导出到 Python HTTP 客户端。
-
-### 启动
+## 更新与备份
 
 ```bash
-docker compose up -d --build
+cd GLaDOS_checkin_auto
+git pull --ff-only
+sudo bash deploy/debian/setup.sh
 ```
 
-打开 [http://127.0.0.1:8791](http://127.0.0.1:8791)。页面默认只绑定本机回环地址，避免 Cookie 管理界面暴露到公网。
-
-首次启动时会导入以下可选本地文件；随后 UI 保存的 `data/config.json` 是唯一配置来源：
-
-- `secret/cookie_json`：**优先使用**的 JSON 账号数组；每项可填 `name`、`cookie`、`user-agent`，也可在网页中补充域名和专属代理。
-- `secret/cookie`：兼容旧格式 `&` 分隔 Cookie 或上文 JSON 格式；仅在不存在 `cookie_json` 时导入。
-- `secret/proxy`：每行一条代理，支持 `http://user:pass@host:port`、`user:pass@host:port`、`host:port:user:pass` 与 `host:port`。
-
-`secret/` 与 `data/` 已被 `.gitignore` 排除，**不要提交 Cookie、代理账号或 `data/config.json`**。
-
-### Web 管理
-
-- 默认显示一个账号卡片，通过 **＋ 添加账号** / **－ 删除** 管理账号；每张卡独立填写 Cookie、可选登录域名与专属代理。User-Agent 字段仅用于诊断；Camoufox 会管理与浏览器一致的指纹，避免手工覆写造成 Cloudflare 指纹不一致。
-- 未填写专属代理的账号按「公共代理池」轮换。代理失败不会回退到容器直接联网。
-- 可设置每天北京时间的自动签到开关与时间，也可以立即签到全部，或对单个账号点击「单独签到」。
-- 最终结果会显示签到状态、积分、剩余天数、兑换结果、出口 IP 和脱敏后的代理主机；实时日志不会显示 Cookie 或代理密码。
-
-容器使用有头 Camoufox + Xvfb，首次构建会下载浏览器，镜像较大且需要约 1 GB 共享内存。每个账号在运行结束后删除临时浏览器 profile。
-
-### 本机 Edge / Chrome 模式（GLaDOS Turnstile 兜底）
-
-如果 NAS 容器内的 Camoufox 无法取得 GLaDOS 的 Turnstile token，可在 Web 页面选择 **本地浏览器**，让 NAS 调用 Windows 电脑上的真实 Chromium 浏览器完成签到。NAS 不需要安装 Edge 或 Chrome；浏览器实际运行在 Windows 上。
-
-> **必须保持 Windows 本机服务运行。** 该模式下，Windows 电脑开机且 `local_browser.py` 正在运行，NAS 的手动/自动签到才能调用本机 Edge / Chrome。关闭终端、重启电脑或服务退出后，本地浏览器模式会失败。
-
-在 Windows 项目目录启动服务：
+升级前可在受限权限位置备份持久数据：
 
 ```bash
-python local_browser.py
+sudo tar -C /var/lib -czf glados-checkin-backup.tar.gz glados-checkin
 ```
 
-服务默认监听 `0.0.0.0:8792`，NAS 会访问 Windows 电脑的局域网地址。例如当前部署可用时：
+不要将该备份上传到公开位置。安装成功后，脚本会提示是否有旧应用发布目录暂留；确认新版本稳定后可按提示删除旧目录。
 
-```text
-NAS:     http://192.168.1.120:8791
-Windows: http://192.168.1.114:8792/health
-```
+## GitHub Actions（仅 HTTP 最佳尝试）
 
-页面操作：
-
-1. 在“浏览器模式”选择 **本地浏览器**；
-2. 默认保持“本机浏览器沿用账号代理”**不勾选**，让 Edge / Chrome 走 Windows 的系统网络（例如 Clash TUN）；
-3. 点击 **保存配置**，手动、批量和定时签到都会直接调用本机浏览器；
-4. 单个账号也可点击账号卡片上的 **本机浏览器签到**，跳过 NAS 容器浏览器。
-
-本机服务会优先使用 Chrome，未安装 Chrome 时自动使用 Microsoft Edge。它会接收 NAS 发送的 Cookie 以注入临时/持久浏览器 profile，因此只应在可信局域网中开放 `8792`，并使用 NAS 防火墙限制访问来源。
-
-签到逻辑、Web API、页面和容器入口脚本通过 Compose 挂载进容器。修改这些文件后无需重新构建镜像，只需重新创建容器：
-
-```bash
-docker compose up -d --force-recreate --no-build
-```
-
-只有修改 `requirements.txt`、Dockerfile 中的系统依赖或 Camoufox 浏览器时，才需要执行 `docker compose up -d --build`。
-
----
-
-## GitHub Actions 部署（不适用于 Cloudflare 人机验证）
-
-GitHub Actions 仍保留用于未被 Cloudflare 阻止的账号：
-
-1. Fork 本仓库。
-2. 在 Fork 的仓库进入 `Settings` -> `Secrets and variables` -> `Actions` -> `New repository secret`。
-3. 添加 `GLADOS_COOKIES`（填入上述 JSON 数组或 Cookie 内容）。
-4. 进入 `Actions` 标签页，启用工作流。
-5. 可以手动触发一次 `workflow_dispatch` 检验运行状态，每天定时自动执行。
-
-若 Action 日志出现 Cloudflare HTML / 人机验证页，请改用上方的本地容器服务。
+GitHub Actions 继续保留纯 HTTP 签到路径，依赖文件为 `requirements-cli.txt`。它不运行浏览器，也不适用于需要 Cloudflare/Turnstile 验证的账号。Cloudflare 受阻时，请使用本分支的原生 Chromium 服务并检查浏览器/代理诊断，而不是尝试伪造验证 token。

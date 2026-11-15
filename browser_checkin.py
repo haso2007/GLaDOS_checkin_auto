@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import random
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -111,8 +108,18 @@ class BrowserAPI:
             # The page renders Turnstile after the click. A code=5 response is
             # the site's first rejection while the widget is still solving, so
             # wait for the widget and let the page submit again.
+            def click_checkin() -> None:
+                try:
+                    button.click(timeout=15_000)
+                except Exception as exc:
+                    # GLaDOS's interaction-only Turnstile can temporarily cover the
+                    # enabled button. This changes only Playwright hit-testing; the
+                    # page still has to create a token and return its POST response.
+                    self.log(LogEmoji.WARNING, f"签到按钮常规点击受阻，改用页面按钮事件重试：{exc}", True)
+                    button.click(timeout=15_000, force=True)
+
             self.log(LogEmoji.CHECKIN, "点击网页签到按钮，等待 Cloudflare Turnstile")
-            button.click(timeout=10_000)
+            click_checkin()
             deadline = time.monotonic() + 110
             attempts = 0
             while time.monotonic() < deadline:
@@ -122,7 +129,7 @@ class BrowserAPI:
                 if token:
                     self.log(LogEmoji.INFO, f"Cloudflare Turnstile 已通过（token 长度 {len(token)}），重新提交签到", True)
                     responses.clear()
-                    button.click(timeout=10_000)
+                    click_checkin()
                     continue
                 if attempts < 3 and (has_turnstile_widget(page) or responses):
                     attempts += 1
@@ -140,7 +147,7 @@ class BrowserAPI:
                         continue
                     responses.clear()
                     self.log(LogEmoji.WARNING, "验证未签发 token，重新点击签到按钮", True)
-                    button.click(timeout=10_000)
+                    click_checkin()
                     continue
                 page.wait_for_timeout(500)
             if responses and accepted(responses[-1]):
@@ -193,13 +200,11 @@ class BrowserAPI:
 
 
 class BrowserCheckinRunner:
-    """Sequentially run one disposable Camoufox environment per configured account."""
+    """Sequentially run one disposable native Chromium environment per account."""
 
-    def __init__(self, config: Config, proxies: Iterable[str] = (), account_meta: dict[str, AccountRunMeta] | None = None, headless: bool = False, local_only: bool = False, local_use_account_proxy: bool = False):
+    def __init__(self, config: Config, proxies: Iterable[str] = (), account_meta: dict[str, AccountRunMeta] | None = None, headless: bool = True):
         self.config = config
         self.headless = bool(headless)
-        self.local_only = bool(local_only)
-        self.local_use_account_proxy = bool(local_use_account_proxy)
         self.proxies = list(proxies)
         self.account_meta = account_meta or {}
         self.runtime: dict[str, dict[str, str]] = {}
@@ -250,16 +255,6 @@ class BrowserCheckinRunner:
         proxies = self._candidate_proxies(meta, index)
         last_error = ""
         resolved_domain = entry.origin or "glados.cloud"
-        if self.local_only:
-            proxy = (proxies[0] if proxies else "") if self.local_use_account_proxy else ""
-            entry.log(resolved_domain, LogEmoji.START, f"直接使用本机真实浏览器（{'沿用账号代理：' + proxy_label(proxy) if proxy else '使用本机系统网络'}）", True)
-            if self._run_local_browser(entry, meta, proxy, resolved_domain):
-                return
-            last_error = "本机浏览器未完成签到"
-            entry.result = CheckinResult.failure(resolved_domain)
-            entry.result.note = last_error
-            entry._log_result()
-            return
         for attempt, proxy in enumerate(proxies, 1):
             try:
                 entry.log(entry.origin or UNPROBED, LogEmoji.START, f"建立独立浏览器环境（第 {attempt}/{len(proxies)} 条代理：{proxy_label(proxy)}）", True)
@@ -286,9 +281,7 @@ class BrowserCheckinRunner:
                     return
             except (BrowserEnvironmentError, VerificationError) as exc:
                 last_error = str(exc)
-                entry.log(entry.origin or UNPROBED, LogEmoji.WARNING, f"浏览器环境失败：{exc}", True)
-                if self._run_local_browser(entry, meta, proxy, resolved_domain):
-                    return
+                entry.log(entry.origin or UNPROBED, LogEmoji.WARNING, f"Chromium 浏览器环境失败：{exc}", True)
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
                 logger.exception("账号 %s 在浏览器签到时出现未预期异常", entry.label)
@@ -297,34 +290,6 @@ class BrowserCheckinRunner:
         entry.result = CheckinResult.failure(entry.origin or UNPROBED)
         entry.result.note = f"所有代理均失败：{last_error or '未知错误'}"
         entry._log_result()
-
-    def _run_local_browser(self, entry: CookieEntry, meta: AccountRunMeta, proxy: str, domain: str) -> bool:
-        """Ask the Windows machine to finish check-in in its real browser."""
-        endpoint = os.environ.get("GLADOS_LOCAL_BROWSER_URL", "").strip().rstrip("/")
-        target = domain if domain and domain != UNPROBED else entry.origin
-        if not endpoint or not target:
-            return False
-        entry.log(target, LogEmoji.INFO, "直接调用本机真实浏览器" if self.local_only else "容器浏览器未通过，改用本机真实浏览器", True)
-        request = urllib.request.Request(
-            f"{endpoint}/checkin",
-            data=json.dumps({"cookie": entry.cookie, "domain": target, "proxy": proxy}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=180) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            entry.log(target, LogEmoji.WARNING, f"本机浏览器不可用：{exc}", True)
-            return False
-        if not isinstance(payload, dict) or not isinstance(payload.get("payload"), dict):
-            entry.log(target, LogEmoji.WARNING, f"本机浏览器失败：{payload.get('error', '无签到结果') if isinstance(payload, dict) else '响应异常'}", True)
-            return False
-        browser = payload.get("browser") or "本机浏览器"
-        self.runtime[meta.account_id] = {"proxy": f"{proxy_label(proxy)} · {browser}", "exit_ip": self.runtime.get(meta.account_id, {}).get("exit_ip", "")}
-        entry.result = parse_checkin(payload["payload"], target, lambda emoji, message, force=False: entry.log(target, emoji, message, True))
-        entry._log_result()
-        return True
 
     def _resolve_domain(
         self,

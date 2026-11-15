@@ -1,4 +1,4 @@
-"""Cloudflare Turnstile helpers used by the isolated Camoufox browser.
+"""Cloudflare Turnstile helpers used by isolated Chromium browser contexts.
 
 The token is always issued by the widget loaded in the current browser page.  This
 module deliberately does not forge a token or invoke ``turnstile.reset()``.

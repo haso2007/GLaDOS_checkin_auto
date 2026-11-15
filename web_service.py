@@ -6,15 +6,16 @@ import copy
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from browser_checkin import AccountRunMeta, BrowserCheckinRunner
 from browser_env import parse_proxy_lines
@@ -44,6 +45,43 @@ class _PersistentLogHandler(logging.Handler):
         self.job.append_log(message, record.levelname)
 
 
+class RuntimeStateStore:
+    """Atomically persist small non-secret operational snapshots beside config.json."""
+
+    def __init__(self, data_dir: Path, filename: str) -> None:
+        self.path = data_dir / filename
+        self._lock = threading.RLock()
+
+    def load(self) -> dict[str, Any]:
+        with self._lock:
+            try:
+                value = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return {}
+        return value if isinstance(value, dict) else {}
+
+    def save(self, value: dict[str, Any]) -> None:
+        encoded = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                dir=self.path.parent,
+            )
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, self.path)
+                os.chmod(self.path, 0o600)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+
 class JobManager:
     """Runs at most one browser job at a time and exposes its safe status to the UI."""
 
@@ -52,6 +90,7 @@ class JobManager:
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._next_log_id = 0
+        self._state_store = RuntimeStateStore(store.data_dir, "job_state.json")
         self._state: dict[str, Any] = {
             "running": False,
             "reason": "",
@@ -60,8 +99,50 @@ class JobManager:
             "logs": read_recent_logs(500),
             "results": [],
             "error": "",
+            "interrupted": False,
         }
+        self._restore_state()
         self._next_log_id = max((int(item.get("id") or 0) for item in self._state["logs"]), default=0)
+
+    def _restore_state(self) -> None:
+        saved = self._state_store.load()
+        if not saved:
+            return
+        self._state.update(
+            {
+                "running": bool(saved.get("running", False)),
+                "reason": str(saved.get("reason") or ""),
+                "started_at": str(saved.get("started_at") or ""),
+                "finished_at": str(saved.get("finished_at") or ""),
+                "results": [item for item in saved.get("results", []) if isinstance(item, dict)],
+                "error": str(saved.get("error") or ""),
+                "interrupted": bool(saved.get("interrupted", False)),
+            }
+        )
+        if self._state["running"]:
+            self._state.update(
+                {
+                    "running": False,
+                    "finished_at": datetime.now(BEIJING_TZ).isoformat(),
+                    "error": "服务在任务执行期间重启；上一轮结果可能不完整，请按需重试失败账号。",
+                    "interrupted": True,
+                }
+            )
+            self._persist_locked()
+
+    def _persist_locked(self) -> None:
+        self._state_store.save(
+            {
+                "version": 1,
+                "running": self._state["running"],
+                "reason": self._state["reason"],
+                "started_at": self._state["started_at"],
+                "finished_at": self._state["finished_at"],
+                "results": self._state["results"],
+                "error": self._state["error"],
+                "interrupted": self._state["interrupted"],
+            }
+        )
 
     def snapshot(self, after: int = 0) -> dict[str, Any]:
         with self._lock:
@@ -90,13 +171,16 @@ class JobManager:
         self,
         reason: str,
         account_id: str | None = None,
-        local_only: bool = False,
         account_ids: set[str] | None = None,
+        on_accept: Callable[[], None] | None = None,
     ) -> bool:
+        """Start a job, optionally atomically claiming an external scheduler slot."""
         selected_ids = set(account_ids) if account_ids is not None else None
         with self._lock:
             if self._state["running"]:
                 return False
+            if on_accept is not None:
+                on_accept()
             self._state.update(
                 {
                     "running": True,
@@ -105,15 +189,28 @@ class JobManager:
                     "finished_at": "",
                     "results": [],
                     "error": "",
+                    "interrupted": False,
                 }
             )
+            self._persist_locked()
             self._thread = threading.Thread(
                 target=self._run,
-                args=(reason, account_id, local_only, selected_ids),
+                args=(reason, account_id, selected_ids),
                 name="glados-browser-checkin",
                 daemon=True,
             )
-            self._thread.start()
+            try:
+                self._thread.start()
+            except Exception:
+                self._state.update(
+                    {
+                        "running": False,
+                        "finished_at": datetime.now(BEIJING_TZ).isoformat(),
+                        "error": "无法启动签到后台任务",
+                    }
+                )
+                self._persist_locked()
+                raise
             return True
 
     def retry_failed(self) -> tuple[bool, int]:
@@ -134,7 +231,6 @@ class JobManager:
         self,
         reason: str,
         account_id: str | None,
-        local_only: bool = False,
         account_ids: set[str] | None = None,
     ) -> None:
         try:
@@ -161,9 +257,7 @@ class JobManager:
                 runtime,
                 proxies=parse_proxy_lines(config_data.get("proxies_text", "")),
                 account_meta=account_meta,
-                headless=bool(config_data.get("browser_headless", False)),
-                local_only=local_only or bool(config_data.get("browser_local", False)),
-                local_use_account_proxy=bool(config_data.get("local_browser_use_account_proxy", False)),
+                headless=config_data.get("browser_mode", "headless") == "headless",
             )
             report = runner.run()
             logger.info("========== 签到总结 ==========")
@@ -173,14 +267,17 @@ class JobManager:
             results = self._serialize_results(report.entries, selected, runner.runtime)
             with self._lock:
                 self._state["results"] = results
+                self._persist_locked()
         except Exception as exc:  # noqa: BLE001
             logger.exception("任务失败：%s", exc)
             with self._lock:
                 self._state["error"] = str(exc)
+                self._persist_locked()
         finally:
             with self._lock:
                 self._state["running"] = False
                 self._state["finished_at"] = datetime.now(BEIJING_TZ).isoformat()
+                self._persist_locked()
 
     @staticmethod
     def _select_accounts(
@@ -253,14 +350,20 @@ class JobManager:
 
 
 class Scheduler:
-    """Small in-process daily scheduler; persistence is not needed beyond each date key."""
+    """Small in-process daily scheduler with a persistent daily-run claim."""
 
     def __init__(self, store: ConfigStore, jobs: JobManager) -> None:
         self.store = store
         self.jobs = jobs
         self._stop = threading.Event()
-        self._last_key = ""
+        self._state_store = RuntimeStateStore(store.data_dir, "scheduler_state.json")
+        self._last_key = str(self._state_store.load().get("last_started_key") or "")
         self._thread = threading.Thread(target=self._loop, name="glados-scheduler", daemon=True)
+
+    def _claim_key(self, key: str, started_at: str) -> None:
+        """Persist the accepted scheduler key before its job thread can run."""
+        self._state_store.save({"version": 1, "last_started_key": key, "started_at": started_at})
+        self._last_key = key
 
     def start(self) -> None:
         self._thread.start()
@@ -281,8 +384,7 @@ class Scheduler:
                 key = now.strftime("%Y-%m-%d %H:%M")
                 if key == self._last_key:
                     continue
-                self._last_key = key
-                if self.jobs.start("定时"):
+                if self.jobs.start("定时", on_accept=lambda: self._claim_key(key, now.isoformat())):
                     logger.info("已启动 %s 自动签到", key)
                 else:
                     logger.warning("%s 定时签到跳过：已有任务执行中", key)
@@ -314,8 +416,27 @@ def create_app() -> FastAPI:
         return FileResponse(INDEX)
 
     @app.get("/api/health")
-    def health() -> dict[str, Any]:
-        return {"ok": True, "version": "browser-cf-1", "running": jobs.snapshot()["running"]}
+    def health(deep: bool = False) -> JSONResponse:
+        """Report browser readiness; deep mode launches only a local about:blank page."""
+        from browser_env import chromium_executable, smoke_chromium
+
+        try:
+            executable = chromium_executable()
+            browser: dict[str, Any] = {"ready": True, "executable": executable}
+            if deep:
+                browser["smoke"] = smoke_chromium()
+        except Exception as exc:  # noqa: BLE001
+            browser = {"ready": False, "error": str(exc)}
+        ready = bool(browser.get("ready"))
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "ok": ready,
+                "version": "native-chromium-1",
+                "running": jobs.snapshot()["running"],
+                "browser": browser,
+            },
+        )
 
     @app.get("/api/config")
     def get_config() -> dict[str, Any]:
@@ -359,12 +480,6 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail="已有签到任务正在执行")
         return {"ok": True}
 
-    @app.post("/api/accounts/{account_id}/run-local")
-    def run_one_local(account_id: str) -> dict[str, Any]:
-        if not jobs.start("单账号本机浏览器", account_id=account_id, local_only=True):
-            raise HTTPException(status_code=409, detail="已有签到任务正在执行")
-        return {"ok": True}
-
     return app
 
 
@@ -374,4 +489,4 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host=os.environ.get("WEB_HOST", "127.0.0.1"), port=int(os.environ.get("WEB_PORT", "8791")))
+    uvicorn.run(app, host=os.environ.get("WEB_HOST", "127.0.0.1"), port=int(os.environ.get("WEB_PORT", "3000")))

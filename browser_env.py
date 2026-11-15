@@ -1,8 +1,14 @@
-"""Isolated Camoufox environments for Cloudflare-protected GLaDOS accounts."""
+"""Disposable native Chromium environments for Cloudflare-protected GLaDOS accounts.
+
+This module intentionally keeps the browser page as the owner of Cloudflare
+cookies, Turnstile tokens, and the current GLaDOS client protocol. Each account
+uses a temporary Chromium profile which is removed after its run.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -21,7 +27,7 @@ Log = Callable[[str], None]
 
 
 class BrowserEnvironmentError(RuntimeError):
-    """A browser environment or browser-context request failed."""
+    """A native browser environment or browser-context request failed."""
 
 
 @dataclass(frozen=True)
@@ -45,15 +51,22 @@ class BrowserResponse:
 
 
 def normalize_proxy(value: str) -> str:
-    """Accept the proxy formats supported by the existing Proxy001 console."""
+    """Accept only proxy forms that Chromium can use without protocol mutation."""
     text = str(value or "").strip()
     if not text:
         return ""
     if "://" in text:
         parsed = urlparse(text)
+        scheme = parsed.scheme.lower()
         if not parsed.hostname:
             raise ValueError("无法解析代理地址")
-        return text
+        if scheme in {"http", "https"}:
+            return text
+        if scheme == "socks5" and parsed.username is None and parsed.password is None:
+            return text
+        if scheme in {"socks", "socks5", "socks5h"}:
+            raise ValueError("当前原生 Chromium 仅支持无认证 socks5:// 代理；请使用 HTTP(S) 认证代理")
+        raise ValueError("仅支持 http://、https:// 或无认证 socks5:// 代理")
     if "@" in text:
         return f"http://{text}"
     parts = text.split(":")
@@ -88,19 +101,18 @@ def proxy_label(proxy: str) -> str:
 
 
 def _browser_proxy(proxy: str) -> dict[str, str] | None:
+    """Convert a previously validated proxy to Playwright's explicit shape."""
     if not proxy:
         return None
     parsed = urlparse(proxy)
     if not parsed.hostname:
         raise BrowserEnvironmentError("代理地址缺少主机名")
     scheme = (parsed.scheme or "http").lower()
-    if scheme in {"socks", "socks5", "socks5h"} and parsed.username:
-        # Firefox cannot authenticate to SOCKS5; preserve the existing console behavior.
-        scheme = "http"
-    elif scheme == "socks5h":
-        scheme = "socks5"
-    server = f"{scheme}://{parsed.hostname}{f':{parsed.port}' if parsed.port else ''}"
-    result = {"server": server}
+    if scheme not in {"http", "https", "socks5"}:
+        raise BrowserEnvironmentError("原生 Chromium 不支持该代理协议")
+    if scheme == "socks5" and (parsed.username is not None or parsed.password is not None):
+        raise BrowserEnvironmentError("原生 Chromium 不支持认证 socks5 代理")
+    result = {"server": f"{scheme}://{parsed.hostname}{f':{parsed.port}' if parsed.port else ''}"}
     if parsed.username:
         result["username"] = unquote(parsed.username)
     if parsed.password is not None:
@@ -109,7 +121,7 @@ def _browser_proxy(proxy: str) -> dict[str, str] | None:
 
 
 def probe_exit_ip(proxy: str) -> tuple[str, str]:
-    """Get proxy exit information without inheriting host proxy environment variables."""
+    """Get proxy exit information without inheriting unrelated host proxy variables."""
     kwargs: dict[str, Any] = {"timeout": 15, "follow_redirects": True, "trust_env": False}
     if proxy:
         kwargs["proxy"] = proxy
@@ -132,10 +144,77 @@ def _cookie_pairs(raw_cookie: str) -> list[tuple[str, str]]:
     return pairs
 
 
-class BrowserEnvironment:
-    """One disposable browser profile, one account cookie, and one proxy."""
+def chromium_executable() -> str:
+    """Resolve the distro-managed Chromium binary without downloading one."""
+    configured = os.environ.get("GLADOS_CHROMIUM_EXECUTABLE", "").strip()
+    candidates = [configured] if configured else []
+    candidates.extend(filter(None, (shutil.which("chromium"), shutil.which("chromium-browser"), "/usr/bin/chromium")))
+    for candidate in candidates:
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    raise BrowserEnvironmentError(
+        "未找到原生 Chromium；请安装 Debian chromium 或设置 GLADOS_CHROMIUM_EXECUTABLE"
+    )
 
-    def __init__(self, cookie: str, proxy: str = "", user_agent: str = "", log: Log | None = None, headless: bool = False):
+
+def chromium_launch_args() -> list[str]:
+    """Return conservative browser flags shared by checks and account sessions."""
+    return [
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-features=Translate,OptimizationHints",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    ]
+
+
+def smoke_chromium() -> str:
+    """Launch and close a no-network Chromium page without account data."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise BrowserEnvironmentError("未安装 Playwright；请安装原生 Debian 服务依赖") from exc
+
+    executable = chromium_executable()
+    profile_root = Path(os.environ.get("GLADOS_BROWSER_PROFILE_DIR", "").strip() or tempfile.gettempdir())
+    profile_root.mkdir(parents=True, exist_ok=True)
+    profile = Path(tempfile.mkdtemp(prefix="glados-chromium-smoke-", dir=profile_root))
+    manager: Any = None
+    context: Any = None
+    try:
+        manager = sync_playwright().start()
+        context = manager.chromium.launch_persistent_context(
+            user_data_dir=str(profile),
+            executable_path=executable,
+            headless=True,
+            args=chromium_launch_args(),
+            viewport={"width": 1366, "height": 900},
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        page.goto("about:blank", wait_until="commit", timeout=15_000)
+        return executable
+    except Exception as exc:  # pragma: no cover - depends on host Chromium
+        raise BrowserEnvironmentError(f"原生 Chromium 自检失败：{exc}") from exc
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if manager is not None:
+            try:
+                manager.stop()
+            except Exception:
+                pass
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+class BrowserEnvironment:
+    """One disposable native Chromium profile, one account cookie, and one proxy."""
+
+    def __init__(self, cookie: str, proxy: str = "", user_agent: str = "", log: Log | None = None, headless: bool = True):
         self.cookie = cookie
         self.headless = bool(headless)
         self.proxy = normalize_proxy(proxy) if proxy else ""
@@ -146,6 +225,7 @@ class BrowserEnvironment:
         self.page: Any = None
         self.profile: Path | None = None
         self.exit_ip = ""
+        self.executable = ""
         self._cookie_domains: set[str] = set()
         self._opened_domain = ""
 
@@ -161,111 +241,62 @@ class BrowserEnvironment:
         if self.context is not None:
             return
         try:
-            from camoufox.sync_api import Camoufox
+            from playwright.sync_api import sync_playwright
         except ImportError as exc:
-            raise BrowserEnvironmentError("未安装 Camoufox；请重新构建容器或安装 requirements.txt") from exc
+            raise BrowserEnvironmentError("未安装 Playwright；请安装原生 Debian 服务依赖") from exc
 
-        geoip: str | bool = False
-        try:
-            self.exit_ip, _ = probe_exit_ip(self.proxy)
-            geoip = self.exit_ip
-            self.log(f"{proxy_label(self.proxy)}，出口 IP {self.exit_ip}")
-        except Exception as exc:  # pragma: no cover - network-dependent fallback
-            if self.proxy:
-                geoip = True
-            self.log(f"出口 IP 探测失败，将继续尝试浏览器自动地理定位：{exc}")
+        self.executable = chromium_executable()
+        if self.proxy:
+            # A proxy account may never silently begin a run on the cloud VM's
+            # direct datacenter IP. Fail before Chromium starts if it is unusable.
+            try:
+                self.exit_ip, _ = probe_exit_ip(self.proxy)
+                self.log(f"{proxy_label(self.proxy)}，出口 IP {self.exit_ip}")
+            except Exception as exc:
+                raise BrowserEnvironmentError(f"代理出口探测失败，拒绝直连回退：{exc}") from exc
+        else:
+            try:
+                self.exit_ip, _ = probe_exit_ip("")
+                self.log(f"直连，出口 IP {self.exit_ip}")
+            except Exception as exc:  # pragma: no cover - network-dependent diagnostics
+                self.log(f"直连出口 IP 探测失败：{exc}")
 
-        # Camoufox also performs its own GeoIP lookup when ``geoip`` is set.
-        # Dynamic proxies occasionally time out on that second lookup, even
-        # after our trace request succeeded.  Retry with progressively less
-        # GeoIP automation instead of rejecting a usable proxy outright.
-        variants: list[dict[str, Any]] = []
-        if self.exit_ip:
-            variants.append({"geoip": self.exit_ip, "block_webrtc": True})
-        elif self.proxy:
-            variants.append({"geoip": True, "block_webrtc": True})
-        variants.extend(
-            [
-                {"geoip": False, "block_webrtc": True},
-                {"geoip": False, "block_webrtc": False},
-            ]
-        )
+        profile_root = Path(os.environ.get("GLADOS_BROWSER_PROFILE_DIR", "").strip() or tempfile.gettempdir())
+        profile_root.mkdir(parents=True, exist_ok=True)
+        self.profile = Path(tempfile.mkdtemp(prefix="glados-chromium-", dir=profile_root))
+        options: dict[str, Any] = {
+            "user_data_dir": str(self.profile),
+            "executable_path": self.executable,
+            "headless": self.headless,
+            "args": chromium_launch_args(),
+            "viewport": {"width": 1366, "height": 900},
+        }
+        if self.user_agent:
+            options["user_agent"] = self.user_agent
         browser_proxy = _browser_proxy(self.proxy)
-        last_error: Exception | None = None
-
-        for variant in variants:
-            profile = Path(tempfile.mkdtemp(prefix="glados-cf-"))
-            prefs = {
-                "dom.ipc.processCount": 1,
-                "dom.ipc.processCount.webIsolated": 1,
-                "accessibility.force_disabled": 1,
-                "toolkit.telemetry.enabled": False,
-                "app.normandy.enabled": False,
-                "browser.discovery.enabled": False,
-                "media.autoplay.default": 5,
-            }
-            if self.proxy:
-                # Never fall back to the container IP when an account proxy becomes unavailable.
-                prefs["network.proxy.failover_direct"] = False
-                prefs["network.proxy.socks_remote_dns"] = True
-
-            options: dict[str, Any] = {
-                "headless": self.headless,
-                # Humanized pointer movement is what lets grok-register pass Turnstile.
-                "humanize": True,
-                "i_know_what_im_doing": True,
-                "persistent_context": True,
-                "user_data_dir": str(profile),
-                "os": ("windows",),
-                "geoip": variant["geoip"],
-                "block_webrtc": variant["block_webrtc"],
-                "firefox_user_prefs": prefs,
-            }
-            try:
-                from camoufox.addons import DefaultAddons
-
-                # uBlock can prevent the explicit check-in Turnstile widget from issuing a token.
-                options["exclude_addons"] = [DefaultAddons.UBO]
-            except Exception:
-                pass
-            # Camoufox owns the coordinated User-Agent / navigator fingerprint.
-            # Do not pass a raw per-account UA: it is not a Camoufox launch
-            # option and an inconsistent override makes Cloudflare detection
-            # more likely.
-            if browser_proxy:
-                options["proxy"] = browser_proxy
-
-            manager: Any = None
-            try:
-                manager = Camoufox(**options)
-                context = manager.__enter__()
-                context.set_default_timeout(20_000)
-                context.set_default_navigation_timeout(60_000)
-                self.manager = manager
-                self.context = context
-                self.page = context.new_page()
-                self.profile = profile
-                self.log(
-                    f"已创建隔离浏览器环境（{'无头' if self.headless else '有头'}，{proxy_label(self.proxy)}，"
-                    f"geoip={variant['geoip']}，webrtc_block={variant['block_webrtc']}）"
-                )
-                return
-            except Exception as exc:  # pragma: no cover - depends on host browser/proxy
-                last_error = exc
-                if manager is not None:
-                    try:
-                        manager.__exit__(None, None, None)
-                    except Exception:
-                        pass
-                shutil.rmtree(profile, ignore_errors=True)
-                self.log(f"浏览器启动参数不兼容，改用下一组：{exc}")
-
-        raise BrowserEnvironmentError(f"启动 Camoufox 失败：{last_error}")
+        if browser_proxy:
+            options["proxy"] = browser_proxy
+        try:
+            self.manager = sync_playwright().start()
+            self.context = self.manager.chromium.launch_persistent_context(**options)
+            self.context.set_default_timeout(20_000)
+            self.context.set_default_navigation_timeout(60_000)
+            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            mode = "无头" if self.headless else "有头 Xvfb"
+            self.log(f"已创建隔离 Chromium 环境（{mode}，{proxy_label(self.proxy)}，浏览器 {Path(self.executable).name}）")
+        except Exception as exc:  # pragma: no cover - depends on host Chromium
+            self.close()
+            raise BrowserEnvironmentError(f"启动原生 Chromium 失败：{exc}") from exc
 
     def close(self) -> None:
+        if self.context is not None:
+            try:
+                self.context.close()
+            except Exception:
+                pass
         if self.manager is not None:
             try:
-                self.manager.__exit__(None, None, None)
+                self.manager.stop()
             except Exception:
                 pass
         self.manager = self.context = self.page = None
@@ -312,10 +343,9 @@ class BrowserEnvironment:
         return any(clue in text or clue in title for clue in clues)
 
     def _clear_page_challenge(self, domain: str) -> None:
-        """Clear the visible Cloudflare page, if it has already appeared."""
         if not self._page_looks_like_challenge() and not has_turnstile_widget(self.page):
             return
-        self.log(f"{domain} 出现 Cloudflare 验证，等待浏览器自动通过")
+        self.log(f"{domain} 出现 Cloudflare 验证，等待 Chromium 通过")
         deadline = time.monotonic() + 45
         if has_turnstile_widget(self.page):
             wait_for_turnstile(self.page, timeout=40, log=self.log)
@@ -323,10 +353,7 @@ class BrowserEnvironment:
             if not self._page_looks_like_challenge():
                 self.log("Cloudflare 页面验证已通过")
                 return
-            try:
-                self.page.wait_for_timeout(750)
-            except Exception:
-                time.sleep(0.75)
+            self.page.wait_for_timeout(750)
         raise VerificationError("Cloudflare 页面验证超时")
 
     def _fetch(self, domain: str, method: str, path: str, data: dict[str, Any] | None, json_body: bool) -> BrowserResponse:
@@ -374,7 +401,7 @@ class BrowserEnvironment:
         data: dict[str, Any] | None = None,
         json_body: bool = False,
     ) -> BrowserResponse:
-        """Make a same-origin request so CF cookies and browser TLS state stay together."""
+        """Make a same-origin request so browser cookies and TLS state stay together."""
         self.open_domain(domain)
         response = self._fetch(domain, method, path, data, json_body)
         if response.is_cloudflare_challenge:

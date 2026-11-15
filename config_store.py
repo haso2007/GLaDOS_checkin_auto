@@ -17,9 +17,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_exchange": True,
     "auto_exchange_left_days": 1,
     "verbose": False,
-    "browser_headless": False,
-    "browser_local": False,
-    "local_browser_use_account_proxy": False,
+    # Cloud deployments default to Chromium headless; headed-xvfb is for diagnostics.
+    "browser_mode": "headless",
     "base_urls": "",
     "scheduler": {"enabled": False, "time": "01:10", "timezone": "Asia/Shanghai"},
 }
@@ -134,9 +133,13 @@ class ConfigStore:
         except (TypeError, ValueError):
             result["auto_exchange_left_days"] = 1
         result["verbose"] = bool(source.get("verbose", False))
-        result["browser_headless"] = bool(source.get("browser_headless", False))
-        result["browser_local"] = bool(source.get("browser_local", False))
-        result["local_browser_use_account_proxy"] = bool(source.get("local_browser_use_account_proxy", False))
+        mode = str(source.get("browser_mode") or "").strip()
+        if mode not in {"headless", "headed-xvfb"}:
+            # A native deployment with no prior mode is safely headless. Preserve
+            # an explicit legacy setting only when it actually existed.
+            legacy_headless = source.get("browser_headless")
+            mode = "headless" if legacy_headless is None or bool(legacy_headless) else "headed-xvfb"
+        result["browser_mode"] = mode
         result["base_urls"] = str(source.get("base_urls") or "")
 
         scheduler = source.get("scheduler") if isinstance(source.get("scheduler"), dict) else {}
