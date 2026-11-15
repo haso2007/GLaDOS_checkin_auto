@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -206,10 +207,17 @@ class BrowserCheckinRunner:
     def run(self, account_ids: set[str] | None = None, budget: RunBudget | None = None) -> Report:
         entries = list(self.config.accounts)
         budget = budget or RunBudget()
+        selected: list[tuple[int, CookieEntry, AccountRunMeta]] = []
         for index, entry in enumerate(entries):
             account_id = str(index + 1)
             meta = self.account_meta.get(account_id, AccountRunMeta(account_id))
-            if account_ids is not None and meta.account_id not in account_ids:
+            if account_ids is None or meta.account_id in account_ids:
+                selected.append((index, entry, meta))
+
+        for position, (index, entry, meta) in enumerate(selected):
+            if position and not self._wait_between_accounts(entry, budget):
+                entry.result = CheckinResult.failure(entry.origin or UNPROBED)
+                entry.result.note = "运行超时，已跳过"
                 continue
             if budget.expired():
                 entry.result = CheckinResult.failure(entry.origin or UNPROBED)
@@ -217,6 +225,18 @@ class BrowserCheckinRunner:
                 continue
             self._run_account(entry, meta, index, budget)
         return Report(entries)
+
+    @staticmethod
+    def _wait_between_accounts(entry: CookieEntry, budget: RunBudget) -> bool:
+        """Use a small random gap between accounts without exceeding the job budget."""
+        seconds = random.randint(10, 20)
+        entry.log(entry.origin or UNPROBED, LogEmoji.INFO, f"账号间隔等待 {seconds} 秒后继续", True)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if budget.expired():
+                return False
+            time.sleep(min(0.5, deadline - time.monotonic()))
+        return not budget.expired()
 
     def _candidate_proxies(self, meta: AccountRunMeta, index: int) -> list[str]:
         if meta.proxy:

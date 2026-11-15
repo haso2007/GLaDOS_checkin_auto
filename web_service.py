@@ -86,7 +86,14 @@ class JobManager:
             if len(lines) > 500:
                 del lines[:-500]
 
-    def start(self, reason: str, account_id: str | None = None, local_only: bool = False) -> bool:
+    def start(
+        self,
+        reason: str,
+        account_id: str | None = None,
+        local_only: bool = False,
+        account_ids: set[str] | None = None,
+    ) -> bool:
+        selected_ids = set(account_ids) if account_ids is not None else None
         with self._lock:
             if self._state["running"]:
                 return False
@@ -102,18 +109,39 @@ class JobManager:
             )
             self._thread = threading.Thread(
                 target=self._run,
-                args=(reason, account_id, local_only),
+                args=(reason, account_id, local_only, selected_ids),
                 name="glados-browser-checkin",
                 daemon=True,
             )
             self._thread.start()
             return True
 
-    def _run(self, reason: str, account_id: str | None, local_only: bool = False) -> None:
+    def retry_failed(self) -> tuple[bool, int]:
+        """Retry only the failures produced by the most recently completed job."""
+        with self._lock:
+            if self._state["running"]:
+                return False, 0
+            failed_ids = {
+                str(item.get("account_id") or "")
+                for item in self._state.get("results", [])
+                if item.get("status") == "failure" and item.get("account_id")
+            }
+        if not failed_ids:
+            return False, 0
+        return self.start("重试失败账号", account_ids=failed_ids), len(failed_ids)
+
+    def _run(
+        self,
+        reason: str,
+        account_id: str | None,
+        local_only: bool = False,
+        account_ids: set[str] | None = None,
+    ) -> None:
         try:
-            logger.info("开始%s签到%s", reason, f"：指定账号 {account_id}" if account_id else "")
+            selection_note = f"：指定账号 {account_id}" if account_id else (f"：共 {len(account_ids)} 个失败账号" if account_ids is not None else "")
+            logger.info("开始%s签到%s", reason, selection_note)
             config_data = self.store.load()
-            selected = self._select_accounts(config_data, account_id)
+            selected = self._select_accounts(config_data, account_id, account_ids)
             if not selected:
                 raise RuntimeError("没有可执行账号；请添加并启用至少一个包含 gld:sess 或 koa:sess 的 Cookie")
 
@@ -155,12 +183,21 @@ class JobManager:
                 self._state["finished_at"] = datetime.now(BEIJING_TZ).isoformat()
 
     @staticmethod
-    def _select_accounts(config: dict[str, Any], account_id: str | None) -> list[dict[str, Any]]:
+    def _select_accounts(
+        config: dict[str, Any],
+        account_id: str | None,
+        account_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         accounts = [item for item in config.get("accounts", []) if isinstance(item, dict)]
         if account_id:
             selected = [item for item in accounts if item.get("id") == account_id]
             if not selected:
                 raise RuntimeError("指定账号不存在")
+            return selected
+        if account_ids is not None:
+            selected = [item for item in accounts if item.get("enabled", True) and str(item.get("id") or "") in account_ids]
+            if not selected:
+                raise RuntimeError("上一轮失败账号已被删除或禁用，暂无可重试账号")
             return selected
         return [item for item in accounts if item.get("enabled", True)]
 
@@ -308,6 +345,13 @@ def create_app() -> FastAPI:
         if not jobs.start("手动"):
             raise HTTPException(status_code=409, detail="已有签到任务正在执行")
         return {"ok": True}
+
+    @app.post("/api/run-failed")
+    def run_failed() -> dict[str, Any]:
+        started, count = jobs.retry_failed()
+        if not started:
+            raise HTTPException(status_code=400, detail="上一轮没有可重试的失败账号，或已有任务正在执行")
+        return {"ok": True, "count": count}
 
     @app.post("/api/accounts/{account_id}/run")
     def run_one(account_id: str) -> dict[str, Any]:
