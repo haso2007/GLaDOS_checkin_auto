@@ -47,6 +47,8 @@
 - **Cookie 要求**：必须包含登录会话字段（`koa:sess=` 或 `gld:sess=`）。
 - **重复去重**：同一 Cookie 自动去重，避免重复签到。
 
+把已有 Cookie 写进本机 Edge 或 Chrome、打开已登录控制台的步骤见 [BROWSER_COOKIE_LOGIN.md](BROWSER_COOKIE_LOGIN.md)。文档包含 Cookie-Editor 导入和开发者工具逐条手写两种做法。
+
 ### 兼容格式：`&` 分隔
 
 旧版格式 `cookie1&cookie2` 仍完全兼容支持，脚本运行时会自动识别并提示建议迁移为 JSON 数组。
@@ -94,6 +96,14 @@ docker compose up -d --build
 - 最终结果会显示签到状态、积分、剩余天数、兑换结果、出口 IP 和脱敏后的代理主机；实时日志不会显示 Cookie 或代理密码。
 
 容器使用有头 Camoufox + Xvfb，首次构建会下载浏览器，镜像较大且需要约 1 GB 共享内存。每个账号在运行结束后删除临时浏览器 profile。
+
+### 容器内重新登录
+
+在 Windows 等其他环境登录得到的 Cookie，到容器里签到时可能被拒绝，接口返回 `device-mismatch`（当前浏览器和登录设备不一致）。改 User-Agent 不能把旧会话变成容器浏览器的会话。需要用容器里的 Camoufox 重新登录，让站点把新会话发给这一个浏览器。
+
+在账号卡填写登录邮箱和登录域名，点击 **重新登录**，再点 **发送验证码**。验证码发到邮箱后，填在管理页里并确认。登录成功后，服务只更新 `data/config.json` 里该账号的 Cookie、域名和邮箱，页面上的 Cookie 框会换成新值。之后的容器签到使用这组 Cookie。
+
+登录进行时会占用唯一的浏览器任务，定时签到会跳过这一轮。验证码最多等待 3 分钟。取消、超时或登录失败都不会改掉原来的 Cookie。本机 Edge / Chrome 签到不走这次登录。
 
 ### 本机 Edge / Chrome 模式（GLaDOS Turnstile 兜底）
 

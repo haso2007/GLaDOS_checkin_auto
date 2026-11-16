@@ -29,6 +29,7 @@ services:
       - ./logging_config.py:/app/logging_config.py
       - ./browser_env.py:/app/browser_env.py
       - ./browser_checkin.py:/app/browser_checkin.py
+      - ./browser_login.py:/app/browser_login.py
       - ./turnstile.py:/app/turnstile.py
       - ./config_store.py:/app/config_store.py
       - ./web_service.py:/app/web_service.py

@@ -58,7 +58,7 @@ WORKDIR /app
 COPY --chown=app:app --from=builder /opt/venv /opt/venv
 COPY --chown=app:app --from=builder /opt/camoufox-cache /opt/camoufox-cache
 # Explicit modes prevent permission-less source files copied from NAS shares from breaking Python imports.
-COPY --chown=app:app --chmod=644 glados.py logging_config.py browser_env.py browser_checkin.py turnstile.py config_store.py web_service.py ./
+COPY --chown=app:app --chmod=644 glados.py logging_config.py browser_env.py browser_checkin.py browser_login.py turnstile.py config_store.py web_service.py ./
 COPY --chown=app:app --chmod=644 web/ ./web/
 COPY --chown=app:app --chmod=755 docker/entrypoint.sh ./docker/entrypoint.sh
 RUN install -d -o app -g app /app/data /app/secret

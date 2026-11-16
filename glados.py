@@ -474,7 +474,8 @@ class CookieEntry:
         else:
             self.log(domain, LogEmoji.INFO, "签到未成功，跳过自动兑换")
 
-        result.note = self._expiry_note(result.days)
+        if not result.note:
+            result.note = self._expiry_note(result.days)
         return result
 
     def _apply_exchange(
@@ -835,6 +836,7 @@ def parse_checkin(raw: Optional[Dict], domain: str, log: Callable[..., None], ua
     # ① 设备不匹配
     if code == 4 and raw.get("reason") == "device-mismatch":
         log_reject(4, raw, message, domain, log, ua_hint)
+        result.note = "登录设备不匹配，需在容器浏览器内重新登录"
         return result
 
     # ②~④ ：repeated「已签到」，code==0 成功
