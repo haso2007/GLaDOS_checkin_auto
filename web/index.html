@@ -131,9 +131,10 @@
     function field(labelText, control, wide = false) { const box = document.createElement('div'); if (wide) box.className = 'wide'; const label = document.createElement('label'); label.textContent = labelText; box.append(label, control); return box; }
 
     function setCardCollapsed(card, collapsed) { const toggle = card.querySelector('[data-collapse]'); card.classList.toggle('collapsed', collapsed); if (toggle) { toggle.textContent = collapsed ? '展开' : '收起'; toggle.setAttribute('aria-expanded', String(!collapsed)); } }
-    function updateCardSummary(card, result) { const summary = card.querySelector('[data-summary]'); if (!summary) return; if (!result) { summary.textContent = '未执行'; return; } const icon = result.status === 'success' ? '✅ 成功' : result.status === 'repeat' ? '🔄 已签到' : '❌ 失败'; summary.textContent = `${icon} · ${result.domain || '未知域名'}${result.note ? ` · ${result.note}` : ''}`; }
+    function cacheLabel(card) { return card.dataset.cache === 'ready' ? '独立缓存已建立' : '独立缓存未建立'; }
+    function updateCardSummary(card, result) { const summary = card.querySelector('[data-summary]'); if (!summary) return; const cache = cacheLabel(card); if (!result) { summary.textContent = `未执行 · ${cache}`; return; } const icon = result.status === 'success' ? '✅ 成功' : result.status === 'repeat' ? '🔄 已签到' : '❌ 失败'; summary.textContent = `${icon} · ${result.domain || '未知域名'} · ${cache}${result.note ? ` · ${result.note}` : ''}`; }
     function createAccountCard(account, number) {
-      const card = document.createElement('article'); card.className = 'account-card'; card.dataset.id = account.id;
+      const card = document.createElement('article'); card.className = 'account-card'; card.dataset.id = account.id; card.dataset.cache = account.browser_cache ? 'ready' : 'empty';
       const configured = !!String(account.cookie || '').trim(); setCardCollapsed(card, configured);
       const head = document.createElement('div'); head.className = 'card-head';
       const title = document.createElement('div'); title.className = 'card-title'; title.title = '点击展开或收起账号编辑内容';
@@ -235,17 +236,18 @@
     async function copyLines(lines) { const text = lines.map(logText).join('\n'); if (!text) { setStatus('没有可复制的日志', true); return; } try { await navigator.clipboard.writeText(text); } catch { const area = document.createElement('textarea'); area.value = text; document.body.append(area); area.select(); document.execCommand('copy'); area.remove(); } setStatus(`已复制 ${lines.length} 条日志`); }
     function refreshActionButtons() { document.querySelectorAll('.account-card button[data-action]').forEach(button => { button.disabled = jobRunning; }); document.querySelectorAll('.account-card').forEach(updateReloginPanel); }
     function applyJob(job, replace = false) { const failures = (job.results || []).filter(item => item.status === 'failure').length; jobRunning = !!job.running; $('run-all').disabled = jobRunning; $('retry-failed').disabled = jobRunning || !failures; $('retry-failed').textContent = failures ? `重试失败账号 (${failures})` : '重试失败账号'; refreshActionButtons(); const reloginActive = ['opening', 'awaiting_code', 'submitting'].includes(reloginState.state); if (!reloginActive) setStatus(jobRunning ? `${job.reason || '签到'}任务执行中…` : job.error ? `任务失败：${job.error}` : job.finished_at ? '任务已完成' : '空闲', !!job.error); absorbLogs(job.logs, replace); showResults(job.results); }
-    function reloginMessage(data) { if (data.state === 'opening') return '正在打开登录页并发送验证码…'; if (data.state === 'awaiting_code') return data.error || '验证码已发出，请输入后确认登录'; if (data.state === 'submitting') return '正在提交验证码…'; if (data.state === 'success') return '登录成功，Cookie 已更新。可以单独签到。'; if (data.state === 'failed') return data.error || '重新登录失败，原来的 Cookie 未改动'; return ''; }
+    function reloginMessage(data) { if (data.state === 'opening') return '正在打开登录页并发送验证码…'; if (data.state === 'awaiting_code') return data.error || '验证码已发出，请输入后确认登录'; if (data.state === 'submitting') return '正在提交验证码…'; if (data.state === 'success') return '登录成功，Cookie 和该账号的独立缓存已保存。可以单独签到。'; if (data.state === 'failed') return data.error || '重新登录失败，原来的 Cookie 未改动'; return ''; }
     function createReloginPanel() {
       const panel = document.createElement('div'); panel.className = 'relogin-panel'; panel.dataset.reloginPanel = ''; panel.hidden = true;
-      const hint = document.createElement('div'); hint.className = 'hint'; hint.textContent = '使用上方的邮箱和登录域名。验证码发到邮箱后填在这里，本服务的 Chromium 会完成登录，并只更新这一张卡的 Cookie。最多等待 3 分钟。';
+      const hint = document.createElement('div'); hint.className = 'hint'; hint.textContent = '使用上方的邮箱和登录域名。验证码发到邮箱后填在这里。登录成功后只更新这一张卡的 Cookie，并单独保存这个账号的浏览器缓存。最多等待 3 分钟。';
       const code = input('text', ''); code.placeholder = '邮箱验证码'; code.autocomplete = 'one-time-code'; code.inputMode = 'numeric'; code.dataset.reloginCode = '';
       const status = document.createElement('div'); status.className = 'muted'; status.dataset.reloginStatus = '';
+      const trace = document.createElement('div'); trace.dataset.reloginLog = ''; trace.style.cssText = 'display:none;max-height:180px;overflow:auto;margin-top:8px;padding:8px;background:#0b100a;border:1px solid var(--line);border-radius:8px;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;';
       const send = document.createElement('button'); send.type = 'button'; send.className = 'small'; send.dataset.reloginSend = ''; send.textContent = '发送验证码'; send.addEventListener('click', () => sendRelogin(panel.closest('.account-card')));
       const confirm = document.createElement('button'); confirm.type = 'button'; confirm.className = 'small'; confirm.dataset.reloginConfirm = ''; confirm.textContent = '确认登录'; confirm.hidden = true; confirm.addEventListener('click', () => confirmRelogin(panel.closest('.account-card')));
       const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'ghost small'; cancel.dataset.reloginCancel = ''; cancel.textContent = '取消'; cancel.hidden = true; cancel.addEventListener('click', () => cancelRelogin());
       const row = document.createElement('div'); row.className = 'row'; row.append(send, confirm, cancel);
-      panel.append(hint, field('邮箱验证码', code), status, row);
+      panel.append(hint, field('邮箱验证码', code), status, trace, row);
       return panel;
     }
     function openRelogin(card) { setCardCollapsed(card, false); const email = card.querySelector('[data-field="email"]'); const name = card.querySelector('[data-field="name"]'); if (email && !email.value.trim() && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((name.value || '').trim())) email.value = name.value.trim(); const panel = card.querySelector('[data-relogin-panel]'); if (panel) panel.hidden = false; }
@@ -262,6 +264,11 @@
       panel.querySelector('[data-relogin-confirm]').disabled = phase !== 'awaiting_code';
       panel.querySelector('[data-relogin-code]').disabled = phase !== 'awaiting_code';
       panel.querySelector('[data-relogin-status]').textContent = active ? reloginMessage(reloginState) : '';
+      const trace = panel.querySelector('[data-relogin-log]');
+      const lines = active && Array.isArray(reloginState.logs) ? reloginState.logs : [];
+      trace.style.display = lines.length ? 'block' : 'none';
+      trace.textContent = lines.join('\n');
+      if (lines.length) trace.scrollTop = trace.scrollHeight;
     }
     async function syncReloginCookie(data) { try { const body = await request('/api/config'); const account = (body.config.accounts || []).find(item => item.id === data.account_id); if (account) patchAccount(account.id, {cookie:account.cookie, origin:account.origin, email:account.email}); } catch (error) { setStatus(error.message, true); } }
     function applyRelogin(data) {
@@ -271,7 +278,7 @@
       const active = ['opening', 'awaiting_code', 'submitting'].includes(reloginState.state);
       if (active) setStatus(reloginMessage(reloginState), false);
       else if ((reloginState.revision || 0) !== previous && reloginState.state === 'failed') setStatus(reloginState.error || '重新登录失败', true);
-      else if ((reloginState.revision || 0) !== previous && reloginState.state === 'success') setStatus('重新登录成功，Cookie 已更新，可以单独签到');
+      else if ((reloginState.revision || 0) !== previous && reloginState.state === 'success') setStatus('重新登录成功，该账号的 Cookie 和独立缓存已保存');
       refreshActionButtons();
     }
     async function poll() { try { applyJob(await request(`/api/job?after=${logCursor}`)); applyRelogin(await request('/api/relogin')); } catch (error) { setStatus(error.message, true); } }
@@ -291,7 +298,7 @@
     async function retryFailed() { try { await saveConfig(true); const body = await request('/api/run-failed', {method:'POST'}); setStatus(`开始重试 ${body.count} 个失败账号…`); await poll(); } catch (error) { setStatus(error.message, true); } }
     async function runOne(id) { try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(id)}/run`, {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     async function sendRelogin(card) { if (!card) return; try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(card.dataset.id)}/relogin`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:card.querySelector('[data-field="email"]').value.trim(), origin:card.querySelector('[data-field="origin"]').value.trim()})}); await poll(); } catch (error) { setStatus(error.message, true); } }
-    async function confirmRelogin(card) { if (!card) return; try { const body = await request('/api/relogin/code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code:card.querySelector('[data-relogin-code]').value.trim()})}); patchAccount(card.dataset.id, {cookie:body.cookie, origin:body.origin, email:body.email}); card.querySelector('[data-relogin-code]').value = ''; setStatus('重新登录成功，Cookie 已更新，可以单独签到'); await poll(); } catch (error) { setStatus(error.message, true); await poll(); } }
+    async function confirmRelogin(card) { if (!card) return; try { const body = await request('/api/relogin/code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code:card.querySelector('[data-relogin-code]').value.trim()})}); patchAccount(card.dataset.id, {cookie:body.cookie, origin:body.origin, email:body.email}); card.dataset.cache = 'ready'; updateCardSummary(card, accountResults.get(card.dataset.id)); card.querySelector('[data-relogin-code]').value = ''; setStatus('重新登录成功，该账号的 Cookie 和独立缓存已保存'); await poll(); } catch (error) { setStatus(error.message, true); await poll(); } }
     async function cancelRelogin() { try { await request('/api/relogin/cancel', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     function setBrowserMode(mode) { $('mode-headed').classList.toggle('active', mode === 'headed-xvfb'); $('mode-headless').classList.toggle('active', mode === 'headless'); }
     $('mode-headed').onclick = () => setBrowserMode('headed-xvfb'); $('mode-headless').onclick = () => setBrowserMode('headless');

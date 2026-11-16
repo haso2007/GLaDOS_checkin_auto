@@ -23,7 +23,7 @@ from glados import (
     parse_checkin,
     to_int,
 )
-from turnstile import VerificationError, has_turnstile_widget, read_turnstile_token, wait_for_turnstile
+from turnstile import VerificationError, security_method_name, wait_for_turnstile
 
 
 logger = logging.getLogger(__name__)
@@ -35,16 +35,18 @@ class AccountRunMeta:
 
     account_id: str
     proxy: str = ""
+    state_dir: str = ""
 
 
 class BrowserAPI:
     """A GLaDOS API facade whose requests always originate from the browser page."""
 
-    def __init__(self, environment: BrowserEnvironment, domain: str, entry: CookieEntry, verbose: bool = False):
+    def __init__(self, environment: BrowserEnvironment, domain: str, entry: CookieEntry, verbose: bool = False, security_method: int = 0):
         self.environment = environment
         self.domain = domain
         self.entry = entry
         self.verbose = verbose
+        self.security_method = security_method
 
     def log(self, emoji: str, message: str, force: bool = False) -> None:
         self.entry.log(self.domain, emoji, message, self.verbose or force)
@@ -75,8 +77,10 @@ class BrowserAPI:
         The current frontend gets a nonce-bound, action=checkin Turnstile token
         and submits it as `turnstile` alongside nonce/proof. Reimplementing
         that private client state lost the required token and returned code 5.
-        Clicking the real `.ckb` control preserves all current fields while the
-        response listener still gives the service a structured result.
+        Login in this same browser first. The Security widget is the 300x68 box
+        immediately before Check-in. Click that box once. When its iframe is gone
+        and cf-turnstile-response holds a token, click Check-in. Another click in
+        the same browser does not recover a rejected challenge.
         """
         self.environment.open_domain(self.domain)
         page = self.environment.page
@@ -105,50 +109,26 @@ class BrowserAPI:
                 button.wait_for(state="visible", timeout=20_000)
             except Exception as exc:
                 raise BrowserEnvironmentError("未找到 GLaDOS 签到按钮，页面结构可能已更新或尚未完成加载") from exc
-            # The page renders Turnstile after the click. A code=5 response is
-            # the site's first rejection while the widget is still solving, so
-            # wait for the widget and let the page submit again.
             def click_checkin() -> None:
                 try:
                     button.click(timeout=15_000)
                 except Exception as exc:
-                    # GLaDOS's interaction-only Turnstile can temporarily cover the
-                    # enabled button. This changes only Playwright hit-testing; the
-                    # page still has to create a token and return its POST response.
                     self.log(LogEmoji.WARNING, f"签到按钮常规点击受阻，改用页面按钮事件重试：{exc}", True)
                     button.click(timeout=15_000, force=True)
 
-            self.log(LogEmoji.CHECKIN, "点击网页签到按钮，等待 Cloudflare Turnstile")
+            self.log(LogEmoji.INFO, f"本浏览器只点一次 Security：{security_method_name(self.security_method)}", True)
+            token = wait_for_turnstile(
+                page,
+                timeout=40,
+                method_index=self.security_method,
+                log=lambda message: self.log(LogEmoji.INFO, message, True),
+            )
+            self.log(LogEmoji.CHECKIN, f"Security 已通过（token 长度 {len(token)}），点击 Check-in")
             click_checkin()
-            deadline = time.monotonic() + 110
-            attempts = 0
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if responses and accepted(responses[-1]):
                     return parse_checkin(responses[-1], self.domain, self.log)
-                token = read_turnstile_token(page)
-                if token:
-                    self.log(LogEmoji.INFO, f"Cloudflare Turnstile 已通过（token 长度 {len(token)}），重新提交签到", True)
-                    responses.clear()
-                    click_checkin()
-                    continue
-                if attempts < 3 and (has_turnstile_widget(page) or responses):
-                    attempts += 1
-                    self.log(LogEmoji.INFO, f"第 {attempts}/3 次等待 Cloudflare Turnstile", True)
-                    try:
-                        wait_for_turnstile(
-                            page,
-                            timeout=min(40, deadline - time.monotonic()),
-                            log=lambda message: self.log(LogEmoji.INFO, message, True),
-                        )
-                    except VerificationError:
-                        if not read_turnstile_token(page) and attempts >= 3:
-                            raise
-                    if read_turnstile_token(page):
-                        continue
-                    responses.clear()
-                    self.log(LogEmoji.WARNING, "验证未签发 token，重新点击签到按钮", True)
-                    click_checkin()
-                    continue
                 page.wait_for_timeout(500)
             if responses and accepted(responses[-1]):
                 return parse_checkin(responses[-1], self.domain, self.log)
@@ -254,42 +234,54 @@ class BrowserCheckinRunner:
     def _run_account(self, entry: CookieEntry, meta: AccountRunMeta, index: int, budget: RunBudget) -> None:
         proxies = self._candidate_proxies(meta, index)
         last_error = ""
-        resolved_domain = entry.origin or "glados.cloud"
         for attempt, proxy in enumerate(proxies, 1):
             try:
-                entry.log(entry.origin or UNPROBED, LogEmoji.START, f"建立独立浏览器环境（第 {attempt}/{len(proxies)} 条代理：{proxy_label(proxy)}）", True)
-                with BrowserEnvironment(
-                    entry.cookie,
-                    proxy=proxy,
-                    user_agent=entry.user_agent,
-                    headless=self.headless,
-                    log=lambda message: entry.log(entry.origin or UNPROBED, LogEmoji.INFO, message, True),
-                ) as environment:
-                    self.runtime[meta.account_id] = {"proxy": proxy_label(proxy), "exit_ip": environment.exit_ip}
-                    domain, days = self._resolve_domain(entry, environment, budget)
-                    resolved_domain = domain or resolved_domain
-                    if domain is None:
-                        entry.result = CheckinResult.failure(entry.origin or UNPROBED)
-                        entry.result.note = "未找到有效登录域名"
-                    elif budget.expired():
-                        entry.result = CheckinResult(domain=domain, days=days)
-                        entry.result.note = "运行超时，已跳过签到"
-                    else:
-                        api = BrowserAPI(environment, domain, entry, self.config.verbose)
-                        entry.result = entry._sign_in(api, domain, days, self.config)
-                    entry._log_result()
-                    return
+                entry.log(
+                    entry.origin or UNPROBED,
+                    LogEmoji.START,
+                    f"使用该账号的独立浏览器环境，代理 {attempt}/{len(proxies)}：{proxy_label(proxy)}",
+                    True,
+                )
+                self._run_one_environment(entry, meta, proxy, budget)
+                return
             except (BrowserEnvironmentError, VerificationError) as exc:
                 last_error = str(exc)
-                entry.log(entry.origin or UNPROBED, LogEmoji.WARNING, f"Chromium 浏览器环境失败：{exc}", True)
+                entry.log(entry.origin or UNPROBED, LogEmoji.WARNING, f"本浏览器环境失败，关闭后换下一个：{exc}", True)
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
                 logger.exception("账号 %s 在浏览器签到时出现未预期异常", entry.label)
                 entry.log(entry.origin or UNPROBED, LogEmoji.ERROR, f"浏览器签到异常：{exc}", True)
 
         entry.result = CheckinResult.failure(entry.origin or UNPROBED)
-        entry.result.note = f"所有代理均失败：{last_error or '未知错误'}"
+        entry.result.note = f"所有浏览器环境均失败：{last_error or '未知错误'}"
         entry._log_result()
+
+    def _run_one_environment(self, entry: CookieEntry, meta: AccountRunMeta, proxy: str, budget: RunBudget) -> None:
+        with BrowserEnvironment(
+            entry.cookie,
+            proxy=proxy,
+            user_agent=entry.user_agent,
+            headless=self.headless,
+            log=lambda message: entry.log(entry.origin or UNPROBED, LogEmoji.INFO, message, True),
+            state_dir=meta.state_dir or None,
+        ) as environment:
+            self.runtime[meta.account_id] = {"proxy": proxy_label(proxy), "exit_ip": environment.exit_ip}
+            domain, days = self._resolve_domain(entry, environment, budget)
+            if domain is None:
+                entry.result = CheckinResult.failure(entry.origin or UNPROBED)
+                entry.result.note = "未找到有效登录域名"
+            elif budget.expired():
+                entry.result = CheckinResult(domain=domain, days=days)
+                entry.result.note = "运行超时，已跳过签到"
+            else:
+                api = BrowserAPI(environment, domain, entry, self.config.verbose, security_method=0)
+                entry.result = entry._sign_in(api, domain, days, self.config)
+                if entry.result is not None and entry.result.code in (0, 1):
+                    try:
+                        environment.save_state()
+                    except Exception as exc:  # noqa: BLE001
+                        entry.log(domain, LogEmoji.WARNING, f"签到成功，但账号缓存未写回：{exc}", True)
+            entry._log_result()
 
     def _resolve_domain(
         self,

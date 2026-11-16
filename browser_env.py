@@ -2,7 +2,7 @@
 
 This module intentionally keeps the browser page as the owner of Cloudflare
 cookies, Turnstile tokens, and the current GLaDOS client protocol. Each account
-uses a temporary Chromium profile which is removed after its run.
+opens its own Chromium profile and does not share that profile with another account.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
+from browser_state import saved_cookies, saved_page_pairs, save_browser_state
 from turnstile import VerificationError, has_turnstile_widget, wait_for_turnstile
 
 
@@ -212,11 +213,21 @@ def smoke_chromium() -> str:
 
 
 class BrowserEnvironment:
-    """One disposable native Chromium profile, one account cookie, and one proxy."""
+    """One native Chromium profile for one account. The profile stays on disk."""
 
-    def __init__(self, cookie: str, proxy: str = "", user_agent: str = "", log: Log | None = None, headless: bool = True):
+    def __init__(
+        self,
+        cookie: str,
+        proxy: str = "",
+        user_agent: str = "",
+        log: Log | None = None,
+        headless: bool = True,
+        state_dir: Path | None = None,
+    ):
         self.cookie = cookie
         self.headless = bool(headless)
+        self.state_dir = Path(state_dir) if state_dir else None
+        self._keep_profile = self.state_dir is not None
         self.proxy = normalize_proxy(proxy) if proxy else ""
         self.user_agent = " ".join(str(user_agent or "").split())
         self.log = log or (lambda message: logger.info(message))
@@ -261,9 +272,19 @@ class BrowserEnvironment:
             except Exception as exc:  # pragma: no cover - network-dependent diagnostics
                 self.log(f"直连出口 IP 探测失败：{exc}")
 
-        profile_root = Path(os.environ.get("GLADOS_BROWSER_PROFILE_DIR", "").strip() or tempfile.gettempdir())
-        profile_root.mkdir(parents=True, exist_ok=True)
-        self.profile = Path(tempfile.mkdtemp(prefix="glados-chromium-", dir=profile_root))
+        if self.state_dir is not None:
+            self.profile = self.state_dir / "user-data-dir"
+            self.profile.mkdir(parents=True, exist_ok=True)
+            for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                try:
+                    (self.profile / lock_name).unlink()
+                except OSError:
+                    pass
+            self.log(f"打开该账号的独立浏览器环境 {self.state_dir.name}")
+        else:
+            profile_root = Path(os.environ.get("GLADOS_BROWSER_PROFILE_DIR", "").strip() or tempfile.gettempdir())
+            profile_root.mkdir(parents=True, exist_ok=True)
+            self.profile = Path(tempfile.mkdtemp(prefix="glados-chromium-", dir=profile_root))
         options: dict[str, Any] = {
             "user_data_dir": str(self.profile),
             "executable_path": self.executable,
@@ -283,7 +304,7 @@ class BrowserEnvironment:
             self.context.set_default_navigation_timeout(60_000)
             self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
             mode = "无头" if self.headless else "有头 Xvfb"
-            self.log(f"已创建隔离 Chromium 环境（{mode}，{proxy_label(self.proxy)}，浏览器 {Path(self.executable).name}）")
+            self.log(f"浏览器环境已启动（{mode}，{proxy_label(self.proxy)}，浏览器 {Path(self.executable).name}）")
         except Exception as exc:  # pragma: no cover - depends on host Chromium
             self.close()
             raise BrowserEnvironmentError(f"启动原生 Chromium 失败：{exc}") from exc
@@ -300,11 +321,42 @@ class BrowserEnvironment:
             except Exception:
                 pass
         self.manager = self.context = self.page = None
-        if self.profile is not None:
+        if self.profile is not None and not self._keep_profile:
             shutil.rmtree(self.profile, ignore_errors=True)
-            self.profile = None
+        self.profile = None
         self._cookie_domains.clear()
         self._opened_domain = ""
+
+    def save_state(self) -> None:
+        if self.state_dir is None:
+            return
+        save_browser_state(self, self.state_dir)
+        self.log("已保存该账号的独立浏览器缓存")
+
+    def _install_saved_state(self, domain: str) -> None:
+        """Restore only this account's saved cookies."""
+        if self.state_dir is None or self.context is None:
+            return
+        cookies = saved_cookies(self.state_dir, domain)
+        if not cookies:
+            self.log("该账号还没有可恢复的浏览器缓存")
+            return
+        self.context.add_cookies(cookies)
+        self.log(f"已恢复该账号缓存中的 {len(cookies)} 项 Cookie")
+
+    def _apply_page_storage(self) -> None:
+        if self.state_dir is None or self.page is None:
+            return
+        local_pairs, session_pairs = saved_page_pairs(self.state_dir)
+        if not local_pairs and not session_pairs:
+            return
+        self.page.evaluate(
+            """([localPairs, sessionPairs]) => {
+              for (const [key, value] of localPairs) localStorage.setItem(key, value);
+              for (const [key, value] of sessionPairs) sessionStorage.setItem(key, value);
+            }""",
+            [local_pairs, session_pairs],
+        )
 
     def _install_cookies(self, domain: str) -> None:
         if domain in self._cookie_domains:
@@ -349,11 +401,15 @@ class BrowserEnvironment:
 
     def open_domain(self, domain: str) -> None:
         self.open()
+        self._install_saved_state(domain)
         self._install_cookies(domain)
         if self._opened_domain == domain:
             return
         try:
             self.page.goto(f"https://{domain}/console/checkin", wait_until="domcontentloaded", timeout=60_000)
+            self._apply_page_storage()
+            self.page.reload(wait_until="domcontentloaded", timeout=60_000)
+            self._apply_page_storage()
             self.page.wait_for_timeout(1_000)
         except Exception as exc:
             raise BrowserEnvironmentError(f"打开 {domain} 失败：{exc}") from exc
@@ -374,7 +430,7 @@ class BrowserEnvironment:
             return
         self.log(f"{domain} 出现 Cloudflare 验证，等待 Chromium 通过")
         deadline = time.monotonic() + 45
-        if has_turnstile_widget(self.page):
+        if self._page_looks_like_challenge() and has_turnstile_widget(self.page):
             wait_for_turnstile(self.page, timeout=40, log=self.log)
         while time.monotonic() < deadline:
             if not self._page_looks_like_challenge():

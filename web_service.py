@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from browser_checkin import AccountRunMeta, BrowserCheckinRunner
 from browser_env import BrowserEnvironmentError, normalize_proxy, parse_proxy_lines
+from browser_state import cache_ready, ensure_account_states, state_dir
 from browser_login import (
     CODE_WAIT_SECONDS,
     CodeRejected,
@@ -302,7 +303,11 @@ class JobManager:
 
             runtime = self._make_runtime_config(config_data, selected)
             account_meta = {
-                str(index): AccountRunMeta(account_id=item["id"], proxy=item.get("proxy", ""))
+                str(index): AccountRunMeta(
+                    account_id=item["id"],
+                    proxy=item.get("proxy", ""),
+                    state_dir=str(state_dir(self.store.data_dir, item["id"])),
+                )
                 for index, item in enumerate(selected, 1)
             }
             runner = BrowserCheckinRunner(
@@ -423,6 +428,7 @@ class LoginManager:
             "email": "",
             "origin": "",
             "error": "",
+            "logs": [],
             "revision": 0,
         }
 
@@ -459,6 +465,7 @@ class LoginManager:
                     "email": normalized_email,
                     "origin": normalized_origin,
                     "error": "",
+                    "logs": [],
                 }
             )
             self._state["revision"] += 1
@@ -508,13 +515,16 @@ class LoginManager:
         browser: LoginBrowser | None = None
         try:
             proxies = self._proxies(account)
+            account_state = state_dir(self.store.data_dir, str(account.get("id") or ""))
+            account_state.mkdir(parents=True, exist_ok=True)
             browser = start_login(
                 origin,
                 email,
                 proxies,
                 headless,
-                lambda message: logger.info("%s", message),
+                self._login_log,
                 self._cancel.is_set,
+                account_state,
             )
             self._browser = browser
             self._set("awaiting_code")
@@ -542,6 +552,8 @@ class LoginManager:
                     self._attempt_event.set()
                     continue
                 self.store.update_account_session(str(account.get("id") or ""), cookie=cookie, origin=origin, email=email)
+                browser.environment.save_state()
+                self._login_log("已保存该账号的独立浏览器缓存")
                 with self._lock:
                     self._cookie = cookie
                 self._set("success")
@@ -574,6 +586,17 @@ class LoginManager:
         config = self.store.load()
         proxies = parse_proxy_lines(config.get("proxies_text", ""))
         return proxies or [""]
+
+    def _login_log(self, message: str) -> None:
+        text = str(message or "").strip()
+        if not text:
+            return
+        logger.info("%s", text)
+        with self._lock:
+            logs = list(self._state.get("logs") or [])
+            logs.append(text)
+            self._state["logs"] = logs[-80:]
+            self._state["revision"] += 1
 
     def _set(self, state: str, error: str = "") -> None:
         with self._lock:
@@ -641,6 +664,8 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def startup() -> None:
+        config = store.load()
+        ensure_account_states(store.data_dir, {str(item.get("id") or "") for item in config.get("accounts", []) if item.get("id")})
         scheduler.start()
 
     @app.on_event("shutdown")
@@ -674,13 +699,21 @@ def create_app() -> FastAPI:
             },
         )
 
+    def present_config() -> dict[str, Any]:
+        config = store.load()
+        for account in config.get("accounts", []):
+            account["browser_cache"] = cache_ready(store.data_dir, str(account.get("id") or ""))
+        return config
+
     @app.get("/api/config")
     def get_config() -> dict[str, Any]:
-        return {"config": store.load()}
+        return {"config": present_config()}
 
     @app.put("/api/config")
     def put_config(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        return {"config": store.save(payload)}
+        saved = store.save(payload)
+        ensure_account_states(store.data_dir, {str(item.get("id") or "") for item in saved.get("accounts", []) if item.get("id")})
+        return {"config": present_config()}
 
     @app.get("/api/job")
     def get_job(after: int = 0) -> dict[str, Any]:
