@@ -6,6 +6,7 @@ import copy
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -18,7 +19,15 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
 from browser_checkin import AccountRunMeta, BrowserCheckinRunner
-from browser_env import parse_proxy_lines
+from browser_env import BrowserEnvironmentError, normalize_proxy, parse_proxy_lines
+from browser_login import (
+    CODE_WAIT_SECONDS,
+    CodeRejected,
+    LoginBrowser,
+    LoginCancelled,
+    LoginError,
+    start_login,
+)
 from config_store import ConfigStore
 from glados import CheckinStatus, Config, CookieEntry
 from logging_config import BEIJING_TZ, append_persistent_log, init_logger, log_file_path, query_persistent_logs, read_recent_logs, redact
@@ -27,6 +36,44 @@ from logging_config import BEIJING_TZ, append_persistent_log, init_logger, log_f
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent
 INDEX = ROOT / "web" / "index.html"
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_HOST = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+_LOGIN_ACTIVE = {"opening", "awaiting_code", "submitting"}
+
+
+class BrowserGate:
+    """One Chromium task at a time, shared by check-in and re-login."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.holder = ""
+
+    def try_acquire(self, holder: str) -> bool:
+        with self._lock:
+            if self.holder:
+                return False
+            self.holder = holder
+            return True
+
+    def release(self, holder: str) -> None:
+        with self._lock:
+            if self.holder == holder:
+                self.holder = ""
+
+
+def _normalize_email(value: str) -> str:
+    email = str(value or "").strip()
+    if not _EMAIL.fullmatch(email):
+        raise ValueError("请填写有效邮箱")
+    return email
+
+
+def _normalize_origin(value: str) -> str:
+    text = re.sub(r"^https?://", "", str(value or "").strip(), flags=re.IGNORECASE)
+    host = text.split("/")[0].strip().lower()
+    if not _HOST.fullmatch(host):
+        raise ValueError("请填写登录域名")
+    return host
 
 
 class _PersistentLogHandler(logging.Handler):
@@ -85,8 +132,9 @@ class RuntimeStateStore:
 class JobManager:
     """Runs at most one browser job at a time and exposes its safe status to the UI."""
 
-    def __init__(self, store: ConfigStore) -> None:
+    def __init__(self, store: ConfigStore, gate: BrowserGate | None = None) -> None:
         self.store = store
+        self.gate = gate or BrowserGate()
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._next_log_id = 0
@@ -179,37 +227,41 @@ class JobManager:
         with self._lock:
             if self._state["running"]:
                 return False
-            if on_accept is not None:
-                on_accept()
-            self._state.update(
-                {
-                    "running": True,
-                    "reason": reason,
-                    "started_at": datetime.now(BEIJING_TZ).isoformat(),
-                    "finished_at": "",
-                    "results": [],
-                    "error": "",
-                    "interrupted": False,
-                }
-            )
-            self._persist_locked()
-            self._thread = threading.Thread(
-                target=self._run,
-                args=(reason, account_id, selected_ids),
-                name="glados-browser-checkin",
-                daemon=True,
-            )
+            if not self.gate.try_acquire("checkin"):
+                return False
             try:
-                self._thread.start()
-            except Exception:
+                if on_accept is not None:
+                    on_accept()
                 self._state.update(
                     {
-                        "running": False,
-                        "finished_at": datetime.now(BEIJING_TZ).isoformat(),
-                        "error": "无法启动签到后台任务",
+                        "running": True,
+                        "reason": reason,
+                        "started_at": datetime.now(BEIJING_TZ).isoformat(),
+                        "finished_at": "",
+                        "results": [],
+                        "error": "",
+                        "interrupted": False,
                     }
                 )
                 self._persist_locked()
+                self._thread = threading.Thread(
+                    target=self._run,
+                    args=(reason, account_id, selected_ids),
+                    name="glados-browser-checkin",
+                    daemon=True,
+                )
+                self._thread.start()
+            except Exception:
+                self.gate.release("checkin")
+                if self._state["running"]:
+                    self._state.update(
+                        {
+                            "running": False,
+                            "finished_at": datetime.now(BEIJING_TZ).isoformat(),
+                            "error": "无法启动签到后台任务",
+                        }
+                    )
+                    self._persist_locked()
                 raise
             return True
 
@@ -274,6 +326,7 @@ class JobManager:
                 self._state["error"] = str(exc)
                 self._persist_locked()
         finally:
+            self.gate.release("checkin")
             with self._lock:
                 self._state["running"] = False
                 self._state["finished_at"] = datetime.now(BEIJING_TZ).isoformat()
@@ -349,6 +402,186 @@ class JobManager:
         return output
 
 
+class LoginManager:
+    """Keeps one native Chromium login open until the operator submits the email code."""
+
+    def __init__(self, store: ConfigStore, gate: BrowserGate) -> None:
+        self.store = store
+        self.gate = gate
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._browser: LoginBrowser | None = None
+        self._cancel = threading.Event()
+        self._code_event = threading.Event()
+        self._attempt_event = threading.Event()
+        self._pending_code = ""
+        self._attempt_error = ""
+        self._cookie = ""
+        self._state: dict[str, Any] = {
+            "state": "idle",
+            "account_id": "",
+            "email": "",
+            "origin": "",
+            "error": "",
+            "revision": 0,
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self._state)
+
+    def busy(self) -> bool:
+        with self._lock:
+            return self._state["state"] in _LOGIN_ACTIVE
+
+    def start(self, account_id: str, email: str, origin: str) -> None:
+        normalized_email = _normalize_email(email)
+        normalized_origin = _normalize_origin(origin)
+        config = self.store.load()
+        account = next((item for item in config.get("accounts", []) if item.get("id") == account_id), None)
+        if account is None:
+            raise LookupError(account_id)
+        with self._lock:
+            if self._state["state"] in _LOGIN_ACTIVE:
+                raise RuntimeError("已有重新登录正在执行")
+            if not self.gate.try_acquire("relogin"):
+                raise RuntimeError("已有签到或重新登录正在执行")
+            self._cancel.clear()
+            self._code_event.clear()
+            self._attempt_event.clear()
+            self._pending_code = ""
+            self._attempt_error = ""
+            self._cookie = ""
+            self._state.update(
+                {
+                    "state": "opening",
+                    "account_id": account_id,
+                    "email": normalized_email,
+                    "origin": normalized_origin,
+                    "error": "",
+                }
+            )
+            self._state["revision"] += 1
+            headless = config.get("browser_mode", "headless") == "headless"
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(account, normalized_email, normalized_origin, headless),
+                name="glados-relogin",
+                daemon=True,
+            )
+            try:
+                self._thread.start()
+            except Exception:
+                self._state["state"] = "failed"
+                self._state["error"] = "未能启动重新登录"
+                self._state["revision"] += 1
+                self.gate.release("relogin")
+                raise
+
+    def submit_code(self, code: str) -> dict[str, str]:
+        token = str(code or "").strip()
+        if not re.fullmatch(r"\d{4,8}", token):
+            raise ValueError("验证码应为 4 到 8 位数字")
+        with self._lock:
+            if self._state["state"] != "awaiting_code":
+                raise RuntimeError("当前没有等待验证码的登录")
+            self._attempt_event.clear()
+            self._attempt_error = ""
+            self._pending_code = token
+            self._code_event.set()
+        if not self._attempt_event.wait(150):
+            raise TimeoutError("提交验证码超时")
+        with self._lock:
+            if self._state["state"] == "awaiting_code":
+                raise CodeRejected(self._attempt_error or "验证码未通过，请再试一次")
+            if self._state["state"] != "success":
+                raise LoginError(self._state["error"] or "重新登录失败")
+            cookie = self._cookie
+            self._cookie = ""
+            return {"cookie": cookie, "origin": self._state["origin"], "email": self._state["email"]}
+
+    def cancel(self) -> None:
+        self._cancel.set()
+        self._code_event.set()
+
+    def _run(self, account: dict[str, Any], email: str, origin: str, headless: bool) -> None:
+        browser: LoginBrowser | None = None
+        try:
+            proxies = self._proxies(account)
+            browser = start_login(
+                origin,
+                email,
+                proxies,
+                headless,
+                lambda message: logger.info("%s", message),
+                self._cancel.is_set,
+            )
+            self._browser = browser
+            self._set("awaiting_code")
+            deadline = time.monotonic() + CODE_WAIT_SECONDS
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LoginError("等待验证码超时")
+                if not self._code_event.wait(remaining):
+                    raise LoginError("等待验证码超时")
+                if self._cancel.is_set():
+                    raise LoginCancelled("已取消")
+                with self._lock:
+                    code = self._pending_code
+                    self._pending_code = ""
+                    self._code_event.clear()
+                if not code:
+                    continue
+                self._set("submitting")
+                try:
+                    cookie = browser.submit_code(code)
+                except CodeRejected as exc:
+                    self._attempt_error = str(exc)
+                    self._set("awaiting_code", str(exc))
+                    self._attempt_event.set()
+                    continue
+                self.store.update_account_session(str(account.get("id") or ""), cookie=cookie, origin=origin, email=email)
+                with self._lock:
+                    self._cookie = cookie
+                self._set("success")
+                logger.info("重新登录成功，已更新账号 Cookie")
+                self._attempt_event.set()
+                return
+        except LoginCancelled:
+            logger.info("重新登录已取消")
+            self._set("failed", "已取消")
+        except ValueError as exc:
+            logger.warning("重新登录失败：%s", exc)
+            self._set("failed", str(exc))
+        except (LoginError, BrowserEnvironmentError) as exc:
+            logger.warning("重新登录失败：%s", exc)
+            self._set("failed", str(exc))
+        except Exception:
+            logger.exception("重新登录出现未预期异常")
+            self._set("failed", "重新登录失败")
+        finally:
+            if browser is not None:
+                browser.close()
+            self._browser = None
+            self.gate.release("relogin")
+            self._attempt_event.set()
+
+    def _proxies(self, account: dict[str, Any]) -> list[str]:
+        dedicated = str(account.get("proxy") or "").strip()
+        if dedicated:
+            return [normalize_proxy(dedicated)]
+        config = self.store.load()
+        proxies = parse_proxy_lines(config.get("proxies_text", ""))
+        return proxies or [""]
+
+    def _set(self, state: str, error: str = "") -> None:
+        with self._lock:
+            self._state["state"] = state
+            self._state["error"] = error
+            self._state["revision"] += 1
+
+
 class Scheduler:
     """Small in-process daily scheduler with a persistent daily-run claim."""
 
@@ -395,12 +628,15 @@ class Scheduler:
 def create_app() -> FastAPI:
     init_logger()
     store = ConfigStore()
-    jobs = JobManager(store)
+    gate = BrowserGate()
+    jobs = JobManager(store, gate)
+    logins = LoginManager(store, gate)
     logging.getLogger().addHandler(_PersistentLogHandler(jobs))
     scheduler = Scheduler(store, jobs)
     app = FastAPI(title="GLaDOS Browser Check-in")
     app.state.store = store
     app.state.jobs = jobs
+    app.state.logins = logins
     app.state.scheduler = scheduler
 
     @app.on_event("startup")
@@ -433,7 +669,7 @@ def create_app() -> FastAPI:
             content={
                 "ok": ready,
                 "version": "native-chromium-1",
-                "running": jobs.snapshot()["running"],
+                "running": jobs.snapshot()["running"] or logins.busy(),
                 "browser": browser,
             },
         )
@@ -448,7 +684,48 @@ def create_app() -> FastAPI:
 
     @app.get("/api/job")
     def get_job(after: int = 0) -> dict[str, Any]:
-        return jobs.snapshot(after)
+        snapshot = jobs.snapshot(after)
+        if logins.busy():
+            snapshot["running"] = True
+            snapshot["reason"] = "重新登录"
+        return snapshot
+
+    @app.get("/api/relogin")
+    def get_relogin() -> dict[str, Any]:
+        return logins.snapshot()
+
+    @app.post("/api/accounts/{account_id}/relogin")
+    def start_relogin(account_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        try:
+            logins.start(account_id, str(payload.get("email") or ""), str(payload.get("origin") or ""))
+        except LookupError:
+            raise HTTPException(status_code=404, detail="指定账号不存在") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "relogin": logins.snapshot()}
+
+    @app.post("/api/relogin/code")
+    def submit_relogin_code(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        try:
+            result = logins.submit_code(str(payload.get("code") or ""))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CodeRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        except LoginError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, **result}
+
+    @app.post("/api/relogin/cancel")
+    def cancel_relogin() -> dict[str, Any]:
+        logins.cancel()
+        return {"ok": True}
 
     @app.get("/api/logs/history")
     def log_history(keyword: str = "", limit: int = 1000) -> dict[str, Any]:
@@ -464,7 +741,7 @@ def create_app() -> FastAPI:
     @app.post("/api/run")
     def run_all() -> dict[str, Any]:
         if not jobs.start("手动"):
-            raise HTTPException(status_code=409, detail="已有签到任务正在执行")
+            raise HTTPException(status_code=409, detail="已有签到或重新登录正在执行")
         return {"ok": True}
 
     @app.post("/api/run-failed")
@@ -477,7 +754,7 @@ def create_app() -> FastAPI:
     @app.post("/api/accounts/{account_id}/run")
     def run_one(account_id: str) -> dict[str, Any]:
         if not jobs.start("单账号手动", account_id=account_id):
-            raise HTTPException(status_code=409, detail="已有签到任务正在执行")
+            raise HTTPException(status_code=409, detail="已有签到或重新登录正在执行")
         return {"ok": True}
 
     return app

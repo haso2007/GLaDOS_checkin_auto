@@ -320,6 +320,33 @@ class BrowserEnvironment:
         self.context.add_cookies(cookies)
         self._cookie_domains.add(domain)
 
+    def open_url(self, url: str) -> None:
+        """Open a page without installing the account cookie."""
+        self.open()
+        if self.page is None:
+            raise BrowserEnvironmentError("浏览器页面未启动")
+        host = urlparse(url).hostname or url
+        try:
+            self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            self.page.wait_for_timeout(1_000)
+        except Exception as exc:
+            raise BrowserEnvironmentError(f"打开 {url} 失败：{exc}") from exc
+        self._clear_page_challenge(host)
+
+    def fetch_current(self, path: str) -> BrowserResponse:
+        """Request the current page origin. Cookies already in the browser stay there."""
+        if self.page is None:
+            raise BrowserEnvironmentError("浏览器页面未启动")
+        host = urlparse(self.page.url).hostname
+        if not host:
+            raise BrowserEnvironmentError("当前页面没有可用域名")
+        response = self._fetch(host, "GET", path, None, False)
+        if response.is_cloudflare_challenge:
+            self.log(f"{path} 被 Cloudflare 拦截，尝试完成人机验证")
+            self._clear_page_challenge(host)
+            response = self._fetch(host, "GET", path, None, False)
+        return response
+
     def open_domain(self, domain: str) -> None:
         self.open()
         self._install_cookies(domain)

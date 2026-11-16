@@ -50,6 +50,19 @@ class ConfigStore:
             self._write(normalized)
             return copy.deepcopy(normalized)
 
+    def update_account_session(self, account_id: str, *, cookie: str, origin: str, email: str) -> None:
+        """Replace one saved account session without rewriting the other accounts from the browser form."""
+        with self._lock:
+            config = self.load()
+            for account in config["accounts"]:
+                if account.get("id") == account_id:
+                    account["cookie"] = cookie
+                    account["origin"] = origin
+                    account["email"] = email
+                    self.save(config)
+                    return
+            raise LookupError(account_id)
+
     def _write(self, data: dict[str, Any]) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
@@ -116,6 +129,7 @@ class ConfigStore:
             "id": str(item.get("id") or uuid.uuid4()),
             "enabled": bool(item.get("enabled", True)),
             "name": str(item.get("name") or "").strip(),
+            "email": str(item.get("email") or "").strip(),
             "origin": str(item.get("origin") or "").strip(),
             "cookie": str(item.get("cookie") or "").strip(),
             "user_agent": " ".join(str(item.get("user_agent") or item.get("user-agent") or "").split()),

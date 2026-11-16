@@ -20,6 +20,9 @@
     input:focus,textarea:focus { outline:2px solid rgba(201,238,105,.3); border-color:var(--green); }
     button { color:#17200d; background:var(--green); border:0; border-radius:8px; padding:8px 12px; font-weight:700; cursor:pointer; } button:hover { filter:brightness(1.08); } button:disabled { opacity:.55; cursor:not-allowed; }
     button.ghost { color:var(--text); background:transparent; border:1px solid var(--line); } button.danger { color:#260e0e; background:var(--red); } button.small { padding:6px 9px; font-size:12px; }
+    button.needs-relogin { outline:2px solid var(--yellow); }
+    .relogin-panel { margin-top:10px; padding:10px; border:1px dashed var(--line); border-radius:8px; background:#141b13; }
+    .relogin-panel[hidden] { display:none; }
     .schedule { display:grid; grid-template-columns:1fr auto; gap:12px; align-items:center; padding:10px; border:1px solid var(--line); border-radius:9px; background:var(--card2); }
     .switch { display:inline-flex; align-items:center; gap:8px; cursor:pointer; color:var(--text); font-weight:600; } .switch input { width:17px; height:17px; accent-color:var(--green); }
     #schedule-time { width:112px; }
@@ -61,6 +64,7 @@
         <button id="mode-headed" class="filter-btn" type="button">有头（Xvfb）</button>
       </div>
       <div class="hint">原生 Chromium 默认无头运行。若需要诊断 Cloudflare/Turnstile，可切换有头（Xvfb）；窗口仅存在于服务器虚拟显示器，不会对外暴露。</div>
+      <div class="hint">若签到提示登录设备不匹配，用账号卡上的「重新登录」。验证码在这个页面输入，同一台服务器上的 Chromium 会用新会话覆盖该账号的 Cookie。</div>
       <h2 style="margin-top:18px">签到选项</h2>
       <label class="switch"><input id="auto-exchange" type="checkbox" checked /> 到期自动兑换积分</label>
       <label for="exchange-days">触发兑换的剩余天数</label><input id="exchange-days" type="number" min="0" step="0.5" value="1" />
@@ -118,10 +122,11 @@
     const $ = (id) => document.getElementById(id);
     let config = null;
     let jobRunning = false;
+    let reloginState = {state:'idle', account_id:'', email:'', origin:'', error:'', revision:0};
     const accountResults = new Map();
 
     function newId() { return crypto.randomUUID ? crypto.randomUUID() : `account-${Date.now()}-${Math.random().toString(16).slice(2)}`; }
-    function newAccount() { return {id:newId(), enabled:true, name:'', origin:'', cookie:'', user_agent:'', proxy:''}; }
+    function newAccount() { return {id:newId(), enabled:true, name:'', email:'', origin:'', cookie:'', user_agent:'', proxy:''}; }
     function input(type, value = '') { const el = document.createElement('input'); el.type = type; el.value = value || ''; return el; }
     function field(labelText, control, wide = false) { const box = document.createElement('div'); if (wide) box.className = 'wide'; const label = document.createElement('label'); label.textContent = labelText; box.append(label, control); return box; }
 
@@ -139,19 +144,21 @@
       title.append(enabled, index, nameHead, summary); head.append(title);
       const buttons = document.createElement('div'); buttons.className = 'actions';
       const collapse = document.createElement('button'); collapse.type = 'button'; collapse.className = 'ghost small collapse-toggle'; collapse.dataset.collapse = ''; collapse.addEventListener('click', () => setCardCollapsed(card, !card.classList.contains('collapsed')));
-      const run = document.createElement('button'); run.type = 'button'; run.className = 'ghost small'; run.textContent = '单独签到'; run.addEventListener('click', () => runOne(account.id));
+      const run = document.createElement('button'); run.type = 'button'; run.className = 'ghost small'; run.dataset.action = 'checkin'; run.textContent = '单独签到'; run.addEventListener('click', () => runOne(account.id));
+      const relogin = document.createElement('button'); relogin.type = 'button'; relogin.className = 'ghost small'; relogin.dataset.action = 'relogin'; relogin.textContent = '重新登录'; relogin.addEventListener('click', () => openRelogin(card));
       const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger small'; remove.textContent = '－ 删除'; remove.addEventListener('click', () => { card.remove(); renumber(); });
-      buttons.append(collapse, run, remove); head.append(buttons); card.append(head);
+      buttons.append(collapse, run, relogin, remove); head.append(buttons); card.append(head);
       title.addEventListener('click', event => { if (!event.target.closest('input,button')) setCardCollapsed(card, !card.classList.contains('collapsed')); });
       const details = document.createElement('div'); details.className = 'card-details';
       const grid = document.createElement('div'); grid.className = 'card-grid';
       const name = input('text', account.name); name.placeholder = '备注名，例如主号'; name.dataset.field = 'name'; name.addEventListener('input', () => nameHead.textContent = name.value.trim() || '未命名账号');
+      const email = input('text', account.email); email.placeholder = '重新登录时使用的邮箱'; email.dataset.field = 'email'; email.autocomplete = 'off';
       const origin = input('text', account.origin); origin.placeholder = 'glados.cloud（不填自动探测）'; origin.dataset.field = 'origin';
       const proxy = input('text', account.proxy); proxy.placeholder = '留空使用公共代理池'; proxy.dataset.field = 'proxy';
       const cookie = document.createElement('textarea'); cookie.className = 'cookie'; cookie.placeholder = '粘贴完整 Cookie，必须包含 gld:sess= 或 koa:sess='; cookie.value = account.cookie || ''; cookie.dataset.field = 'cookie';
       const ua = document.createElement('textarea'); ua.className = 'user-agent'; ua.placeholder = '可选：填写获取此 Cookie 时的浏览器 UA；仅覆盖请求 UA，不模拟完整设备指纹'; ua.value = account.user_agent || ''; ua.dataset.field = 'user_agent';
-      grid.append(field('账号名称', name), field('登录域名（可选）', origin), field('专属代理（可选）', proxy), field('Cookie', cookie, true), field('User-Agent（可选）', ua, true));
-      details.append(grid);
+      grid.append(field('账号名称', name), field('登录邮箱（重新登录）', email), field('登录域名（可选）', origin), field('专属代理（可选）', proxy), field('Cookie', cookie, true), field('User-Agent（可选）', ua, true));
+      details.append(grid, createReloginPanel());
       const result = document.createElement('div'); result.className = 'result'; result.dataset.result = ''; details.append(result); card.append(details);
       showAccountResult(card, accountResults.get(account.id));
       updateCardSummary(card, accountResults.get(account.id));
@@ -170,7 +177,7 @@
       const canonicalUa = item.user_agent == null ? '' : String(item.user_agent).trim();
       const legacyUa = item['user-agent'] == null ? '' : String(item['user-agent']).trim();
       if (canonicalUa && legacyUa && canonicalUa !== legacyUa) throw new Error('同一 JSON 账号的 user_agent 与 user-agent 不一致');
-      return {...newAccount(), enabled:item.enabled !== false, name:String(item.name || '').trim(), origin:normalizeImportedOrigin(item.origin), cookie, user_agent:canonicalUa || legacyUa, proxy:String(item.proxy || '').trim()};
+      return {...newAccount(), enabled:item.enabled !== false, name:String(item.name || '').trim(), email:String(item.email || '').trim(), origin:normalizeImportedOrigin(item.origin), cookie, user_agent:canonicalUa || legacyUa, proxy:String(item.proxy || '').trim()};
     }
     function parseImportedAccounts(raw) {
       const text = String(raw || '').replace(/^﻿/, '').trim();
@@ -212,7 +219,7 @@
     function setStatus(text, error = false) { const node = $('status'); node.textContent = text; node.style.color = error ? 'var(--red)' : ''; }
     async function saveConfig(quiet = false) { const save = $('save'); save.disabled = true; try { const body = await request('/api/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(collectConfig())}); config = body.config; if (!quiet) setStatus('配置已保存'); return body.config; } finally { save.disabled = false; } }
 
-    function showAccountResult(card, result) { const box = card.querySelector('[data-result]'); if (!result) { updateCardSummary(card, null); return; } box.className = `result show ${result.status}`; const icon = result.status === 'success' ? '✅' : result.status === 'repeat' ? '🔄' : '❌'; box.textContent = `${icon} ${result.status === 'success' ? '签到成功' : result.status === 'repeat' ? '今日已签到' : '签到失败'} · ${result.domain || '未知域名'} · 剩余 ${result.days ?? '未知'} 天${result.exchange ? ` · ${result.exchange}` : ''}${result.note ? ` · ${result.note}` : ''}`; updateCardSummary(card, result); }
+    function showAccountResult(card, result) { const box = card.querySelector('[data-result]'); const relogin = card.querySelector('[data-action="relogin"]'); if (relogin) relogin.classList.toggle('needs-relogin', !!(result && String(result.note || '').includes('登录设备不匹配'))); if (!result) { updateCardSummary(card, null); return; } box.className = `result show ${result.status}`; const icon = result.status === 'success' ? '✅' : result.status === 'repeat' ? '🔄' : '❌'; box.textContent = `${icon} ${result.status === 'success' ? '签到成功' : result.status === 'repeat' ? '今日已签到' : '签到失败'} · ${result.domain || '未知域名'} · 剩余 ${result.days ?? '未知'} 天${result.exchange ? ` · ${result.exchange}` : ''}${result.note ? ` · ${result.note}` : ''}`; updateCardSummary(card, result); }
     function showResults(results) { const body = $('results-body'); body.textContent = ''; accountResults.clear(); if (!results || !results.length) { const tr = document.createElement('tr'), td = document.createElement('td'); td.colSpan = 9; td.className = 'muted'; td.textContent = '尚无结果'; tr.append(td); body.append(tr); return; } for (const item of results) { accountResults.set(item.account_id, item); const tr = document.createElement('tr'); const values = [item.name, item.status === 'success' ? '✅ 成功' : item.status === 'repeat' ? '🔄 重复' : '❌ 失败', item.domain, item.points, item.points_total ?? '-', item.days ?? '-', item.exchange || '-', [item.proxy, item.exit_ip].filter(Boolean).join(' · ') || '-', item.note || '-']; values.forEach((value, i) => { const td = document.createElement('td'); td.textContent = String(value ?? '-'); if (i === 1) td.className = item.status; tr.append(td); }); body.append(tr); } document.querySelectorAll('.account-card').forEach(card => showAccountResult(card, accountResults.get(card.dataset.id))); }
     const liveLogs = [];
     let logCursor = 0, liveLevel = 'ALL';
@@ -226,8 +233,48 @@
     function renderLive() { const box = $('log'); paintLogs(box, latestScreen(liveLogs.filter(logVisible))); box.scrollTop = 0; }
     function absorbLogs(logs, replace) { if (replace) { liveLogs.length = 0; logCursor = 0; } const incoming = []; for (const line of logs || []) { const id = Number(line.id || 0); if (id && (id <= logCursor || liveLogs.some(item => item.id === id))) continue; incoming.push(line); if (id > logCursor) logCursor = id; } if (!incoming.length && !replace) return; liveLogs.push(...incoming); while (liveLogs.length > 500) liveLogs.shift(); if (!$('auto-scroll').checked && !replace) { $('log-unread').style.display = 'block'; return; } renderLive(); $('log-unread').style.display = 'none'; }
     async function copyLines(lines) { const text = lines.map(logText).join('\n'); if (!text) { setStatus('没有可复制的日志', true); return; } try { await navigator.clipboard.writeText(text); } catch { const area = document.createElement('textarea'); area.value = text; document.body.append(area); area.select(); document.execCommand('copy'); area.remove(); } setStatus(`已复制 ${lines.length} 条日志`); }
-    function applyJob(job, replace = false) { const failures = (job.results || []).filter(item => item.status === 'failure').length; jobRunning = !!job.running; $('run-all').disabled = jobRunning; $('retry-failed').disabled = jobRunning || !failures; $('retry-failed').textContent = failures ? `重试失败账号 (${failures})` : '重试失败账号'; document.querySelectorAll('.account-card button').forEach(button => { if (button.textContent === '单独签到') button.disabled = jobRunning; }); setStatus(jobRunning ? `${job.reason || '签到'}任务执行中…` : job.error ? `任务失败：${job.error}` : job.finished_at ? '任务已完成' : '空闲', !!job.error); absorbLogs(job.logs, replace); showResults(job.results); }
-    async function poll() { try { applyJob(await request(`/api/job?after=${logCursor}`)); } catch (error) { setStatus(error.message, true); } }
+    function refreshActionButtons() { document.querySelectorAll('.account-card button[data-action]').forEach(button => { button.disabled = jobRunning; }); document.querySelectorAll('.account-card').forEach(updateReloginPanel); }
+    function applyJob(job, replace = false) { const failures = (job.results || []).filter(item => item.status === 'failure').length; jobRunning = !!job.running; $('run-all').disabled = jobRunning; $('retry-failed').disabled = jobRunning || !failures; $('retry-failed').textContent = failures ? `重试失败账号 (${failures})` : '重试失败账号'; refreshActionButtons(); const reloginActive = ['opening', 'awaiting_code', 'submitting'].includes(reloginState.state); if (!reloginActive) setStatus(jobRunning ? `${job.reason || '签到'}任务执行中…` : job.error ? `任务失败：${job.error}` : job.finished_at ? '任务已完成' : '空闲', !!job.error); absorbLogs(job.logs, replace); showResults(job.results); }
+    function reloginMessage(data) { if (data.state === 'opening') return '正在打开登录页并发送验证码…'; if (data.state === 'awaiting_code') return data.error || '验证码已发出，请输入后确认登录'; if (data.state === 'submitting') return '正在提交验证码…'; if (data.state === 'success') return '登录成功，Cookie 已更新。可以单独签到。'; if (data.state === 'failed') return data.error || '重新登录失败，原来的 Cookie 未改动'; return ''; }
+    function createReloginPanel() {
+      const panel = document.createElement('div'); panel.className = 'relogin-panel'; panel.dataset.reloginPanel = ''; panel.hidden = true;
+      const hint = document.createElement('div'); hint.className = 'hint'; hint.textContent = '使用上方的邮箱和登录域名。验证码发到邮箱后填在这里，本服务的 Chromium 会完成登录，并只更新这一张卡的 Cookie。最多等待 3 分钟。';
+      const code = input('text', ''); code.placeholder = '邮箱验证码'; code.autocomplete = 'one-time-code'; code.inputMode = 'numeric'; code.dataset.reloginCode = '';
+      const status = document.createElement('div'); status.className = 'muted'; status.dataset.reloginStatus = '';
+      const send = document.createElement('button'); send.type = 'button'; send.className = 'small'; send.dataset.reloginSend = ''; send.textContent = '发送验证码'; send.addEventListener('click', () => sendRelogin(panel.closest('.account-card')));
+      const confirm = document.createElement('button'); confirm.type = 'button'; confirm.className = 'small'; confirm.dataset.reloginConfirm = ''; confirm.textContent = '确认登录'; confirm.hidden = true; confirm.addEventListener('click', () => confirmRelogin(panel.closest('.account-card')));
+      const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'ghost small'; cancel.dataset.reloginCancel = ''; cancel.textContent = '取消'; cancel.hidden = true; cancel.addEventListener('click', () => cancelRelogin());
+      const row = document.createElement('div'); row.className = 'row'; row.append(send, confirm, cancel);
+      panel.append(hint, field('邮箱验证码', code), status, row);
+      return panel;
+    }
+    function openRelogin(card) { setCardCollapsed(card, false); const email = card.querySelector('[data-field="email"]'); const name = card.querySelector('[data-field="name"]'); if (email && !email.value.trim() && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((name.value || '').trim())) email.value = name.value.trim(); const panel = card.querySelector('[data-relogin-panel]'); if (panel) panel.hidden = false; }
+    function patchAccount(id, fields) { const card = document.querySelector(`.account-card[data-id="${CSS.escape(id)}"]`); if (!card) return; Object.entries(fields).forEach(([key, value]) => { const el = card.querySelector(`[data-field="${key}"]`); if (el) el.value = value || ''; }); }
+    function updateReloginPanel(card) {
+      const panel = card.querySelector('[data-relogin-panel]'); if (!panel) return;
+      const active = reloginState.account_id === card.dataset.id;
+      const phase = active ? reloginState.state : 'idle';
+      if (active && phase !== 'idle') { panel.hidden = false; setCardCollapsed(card, false); }
+      const waiting = phase === 'awaiting_code' || phase === 'submitting';
+      panel.querySelector('[data-relogin-confirm]').hidden = !waiting;
+      panel.querySelector('[data-relogin-cancel]').hidden = !(phase === 'opening' || waiting);
+      panel.querySelector('[data-relogin-send]').disabled = jobRunning;
+      panel.querySelector('[data-relogin-confirm]').disabled = phase !== 'awaiting_code';
+      panel.querySelector('[data-relogin-code]').disabled = phase !== 'awaiting_code';
+      panel.querySelector('[data-relogin-status]').textContent = active ? reloginMessage(reloginState) : '';
+    }
+    async function syncReloginCookie(data) { try { const body = await request('/api/config'); const account = (body.config.accounts || []).find(item => item.id === data.account_id); if (account) patchAccount(account.id, {cookie:account.cookie, origin:account.origin, email:account.email}); } catch (error) { setStatus(error.message, true); } }
+    function applyRelogin(data) {
+      const previous = reloginState.revision || 0;
+      reloginState = data || {state:'idle', account_id:'', email:'', origin:'', error:'', revision:0};
+      if ((reloginState.revision || 0) !== previous && reloginState.state === 'success') syncReloginCookie(reloginState);
+      const active = ['opening', 'awaiting_code', 'submitting'].includes(reloginState.state);
+      if (active) setStatus(reloginMessage(reloginState), false);
+      else if ((reloginState.revision || 0) !== previous && reloginState.state === 'failed') setStatus(reloginState.error || '重新登录失败', true);
+      else if ((reloginState.revision || 0) !== previous && reloginState.state === 'success') setStatus('重新登录成功，Cookie 已更新，可以单独签到');
+      refreshActionButtons();
+    }
+    async function poll() { try { applyJob(await request(`/api/job?after=${logCursor}`)); applyRelogin(await request('/api/relogin')); } catch (error) { setStatus(error.message, true); } }
     let historyLogs = [];
     async function queryHistory() { const keyword = $('history-search').value.trim(); const data = await request(`/api/logs/history?keyword=${encodeURIComponent(keyword)}&limit=1000`); historyLogs = data.logs || []; $('history-count').textContent = `匹配 ${data.total || 0} 条，显示 ${historyLogs.length} 条`; paintLogs($('history-log'), historyLogs); if (!historyLogs.length) $('history-log').textContent = '没有匹配的历史日志'; }
     $('tab-live').onclick = () => { $('tab-live').classList.add('active'); $('tab-history').classList.remove('active'); $('live-panel').hidden = false; $('history-panel').hidden = true; $('log-meta').textContent = '未满时完整显示，满后只保留最新一屏'; };
@@ -243,6 +290,9 @@
     async function runAll() { try { await saveConfig(true); await request('/api/run', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     async function retryFailed() { try { await saveConfig(true); const body = await request('/api/run-failed', {method:'POST'}); setStatus(`开始重试 ${body.count} 个失败账号…`); await poll(); } catch (error) { setStatus(error.message, true); } }
     async function runOne(id) { try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(id)}/run`, {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
+    async function sendRelogin(card) { if (!card) return; try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(card.dataset.id)}/relogin`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:card.querySelector('[data-field="email"]').value.trim(), origin:card.querySelector('[data-field="origin"]').value.trim()})}); await poll(); } catch (error) { setStatus(error.message, true); } }
+    async function confirmRelogin(card) { if (!card) return; try { const body = await request('/api/relogin/code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code:card.querySelector('[data-relogin-code]').value.trim()})}); patchAccount(card.dataset.id, {cookie:body.cookie, origin:body.origin, email:body.email}); card.querySelector('[data-relogin-code]').value = ''; setStatus('重新登录成功，Cookie 已更新，可以单独签到'); await poll(); } catch (error) { setStatus(error.message, true); await poll(); } }
+    async function cancelRelogin() { try { await request('/api/relogin/cancel', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     function setBrowserMode(mode) { $('mode-headed').classList.toggle('active', mode === 'headed-xvfb'); $('mode-headless').classList.toggle('active', mode === 'headless'); }
     $('mode-headed').onclick = () => setBrowserMode('headed-xvfb'); $('mode-headless').onclick = () => setBrowserMode('headless');
     async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || ''; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }

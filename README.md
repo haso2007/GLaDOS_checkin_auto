@@ -112,6 +112,15 @@ Cookie 与代理配置默认只经由 Web UI 写入私有数据目录。安装�
 ```
 
 - `cookie` 必须包含 `koa:sess=` 或 `gld:sess=`。
+- 在本机 Edge 或 Chrome 里手工写入已有 Cookie 的步骤见 [BROWSER_COOKIE_LOGIN.md](BROWSER_COOKIE_LOGIN.md)。
+
+### 设备不匹配时重新登录
+
+在其他系统登录得到的 Cookie，到这台 Debian 服务器的 Chromium 上签到时，可能被拒绝为 `device-mismatch`。改 User-Agent 不能把旧会话变成当前浏览器的会话。
+
+在账号卡填写登录邮箱和登录域名，点击 **重新登录**，再点 **发送验证码**。验证码发到邮箱后，填在管理页里并确认。登录由本服务的原生 Chromium 完成，成功后只更新 `/var/lib/glados-checkin/config.json` 里该账号的 Cookie、域名和邮箱。之后的签到使用这组 Cookie。
+
+登录进行时会占用唯一的浏览器任务，定时签到会跳过这一轮。验证码最多等待 3 分钟。取消、超时或登录失败都不会改掉原来的 Cookie。使用的无头或有头模式与当前签到配置相同。
 - `name`、`origin`、`user-agent` 可选；缺少域名时会探测候选 GLaDOS 域名。
 - `user-agent` 应是获取该 Cookie 时的浏览器 UA。原生 Chromium 会使用该请求 UA，但不会模拟完整的操作系统或浏览器指纹。
 - 支持旧版 `cookie1&cookie2` 格式。
