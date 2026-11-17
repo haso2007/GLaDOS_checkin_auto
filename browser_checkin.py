@@ -117,7 +117,7 @@ class BrowserAPI:
                     self.log(LogEmoji.WARNING, f"签到按钮常规点击受阻，改用页面按钮事件重试：{exc}", True)
                     button.click(timeout=15_000, force=True)
 
-            self.log(LogEmoji.INFO, "在当前桌面浏览器里点击画面上的 Security，并轮询等待通过", True)
+            self.log(LogEmoji.INFO, "在当前虚拟屏幕的有头浏览器里点击 Security，并轮询等待通过", True)
             if self.cancelled is not None and self.cancelled():
                 raise VerificationError("已退出")
             token = wait_for_turnstile(

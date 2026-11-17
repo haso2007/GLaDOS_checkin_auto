@@ -299,12 +299,10 @@ def _cookie_pairs(raw_cookie: str) -> list[tuple[str, str]]:
 
 
 def browser_display() -> str:
-    """Use the desktop screen when it exists. The service itself stays on Xvfb."""
+    """Use the current virtual display. Headed Xvfb stays off the desktop unless overridden."""
     configured = os.environ.get("GLADOS_BROWSER_DISPLAY", "").strip()
     if configured:
         return configured
-    if Path("/tmp/.X11-unix/X1").exists():
-        return ":1"
     return os.environ.get("DISPLAY", "").strip()
 
 
@@ -492,7 +490,7 @@ class BrowserEnvironment:
         display = browser_display()
         if display and not self.headless:
             launch_env["DISPLAY"] = display
-            self.log(f"浏览器打开在桌面屏幕 {display}")
+            self.log(f"浏览器在虚拟屏幕 {display} 上有头运行，不显示到桌面")
         try:
             self._process = subprocess.Popen(
                 command,
@@ -510,7 +508,7 @@ class BrowserEnvironment:
             self.context.set_default_timeout(20_000)
             self.context.set_default_navigation_timeout(60_000)
             self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-            mode = "无头" if self.headless else f"桌面 {display or '当前屏幕'}"
+            mode = "无头" if self.headless else f"有头 Xvfb {display or '当前屏幕'}"
             self.log(f"系统 Chromium 已启动（{mode}，{proxy_label(self.proxy)}，浏览器 {Path(self.executable).name}）")
         except Exception as exc:  # pragma: no cover - depends on host Chromium
             self.close()
