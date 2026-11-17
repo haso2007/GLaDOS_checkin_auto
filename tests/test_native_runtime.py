@@ -49,10 +49,16 @@ class NativeRuntimeTests(unittest.TestCase):
             def close(self) -> None:
                 pass
 
+        class FakeBrowser:
+            contexts = [FakeContext()]
+
+            def close(self) -> None:
+                pass
+
         class FakeChromium:
-            def launch_persistent_context(self, **options: object) -> FakeContext:
-                captured.update(options)
-                return FakeContext()
+            def connect_over_cdp(self, endpoint: str) -> FakeBrowser:
+                captured["endpoint"] = endpoint
+                return FakeBrowser()
 
         class FakeManager:
             chromium = FakeChromium()
@@ -78,13 +84,19 @@ class NativeRuntimeTests(unittest.TestCase):
                 os.environ,
                 {"GLADOS_CHROMIUM_EXECUTABLE": str(executable), "GLADOS_BROWSER_PROFILE_DIR": directory},
                 clear=False,
-            ), patch("browser_env.probe_exit_ip", return_value=("203.0.113.1", "")):
+            ), patch("browser_env.probe_exit_ip", return_value=("203.0.113.1", "")), patch(
+                "browser_env.subprocess.Popen",
+                side_effect=lambda command, **kwargs: captured.update({"command": command}) or types.SimpleNamespace(pid=1, poll=lambda: None, wait=lambda timeout=0: 0, terminate=lambda: None, kill=lambda: None),
+            ), patch("browser_env._wait_for_cdp"), patch("browser_env.os.killpg"):
                 environment = BrowserEnvironment("gld:sess=value", user_agent="Agent/1.0")
                 environment.open()
                 environment.close()
 
-        self.assertEqual(captured["user_agent"], "Agent/1.0")
-        self.assertTrue(captured["headless"])
+        command = " ".join(str(part) for part in captured["command"])
+        self.assertIn("--user-agent=Agent/1.0", command)
+        self.assertIn("--headless=new", command)
+        self.assertIn("--user-data-dir=", command)
+        self.assertTrue(str(captured["endpoint"]).startswith("http://127.0.0.1:"))
 
     def test_job_results_are_restored_for_retry_after_restart(self) -> None:
         data_dir = Path(tempfile.mkdtemp())

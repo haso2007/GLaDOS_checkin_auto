@@ -10,8 +10,12 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import signal
+import socket
+import subprocess
 import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -20,7 +24,7 @@ from urllib.parse import quote, unquote, urlparse
 import httpx
 
 from browser_state import saved_cookies, saved_page_pairs, save_browser_state
-from turnstile import VerificationError, has_turnstile_widget, wait_for_turnstile
+from turnstile import VerificationError, wait_for_turnstile
 
 
 logger = logging.getLogger(__name__)
@@ -145,6 +149,16 @@ def _cookie_pairs(raw_cookie: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def browser_display() -> str:
+    """Use the desktop screen when it exists. The service itself stays on Xvfb."""
+    configured = os.environ.get("GLADOS_BROWSER_DISPLAY", "").strip()
+    if configured:
+        return configured
+    if Path("/tmp/.X11-unix/X1").exists():
+        return ":1"
+    return os.environ.get("DISPLAY", "").strip()
+
+
 def chromium_executable() -> str:
     """Resolve the distro-managed Chromium binary without downloading one."""
     configured = os.environ.get("GLADOS_CHROMIUM_EXECUTABLE", "").strip()
@@ -157,6 +171,25 @@ def chromium_executable() -> str:
     raise BrowserEnvironmentError(
         "未找到原生 Chromium；请安装 Debian chromium 或设置 GLADOS_CHROMIUM_EXECUTABLE"
     )
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_cdp(port: int) -> None:
+    deadline = time.monotonic() + 20
+    url = f"http://127.0.0.1:{port}/json/version"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=0.4) as response:
+                if response.status == 200:
+                    return
+        except Exception:
+            time.sleep(0.25)
+    raise BrowserEnvironmentError("Chromium 调试端口没有就绪")
 
 
 def chromium_launch_args() -> list[str]:
@@ -232,8 +265,10 @@ class BrowserEnvironment:
         self.user_agent = " ".join(str(user_agent or "").split())
         self.log = log or (lambda message: logger.info(message))
         self.manager: Any = None
+        self.browser: Any = None
         self.context: Any = None
         self.page: Any = None
+        self._process: subprocess.Popen[bytes] | None = None
         self.profile: Path | None = None
         self.exit_ip = ""
         self.executable = ""
@@ -285,34 +320,53 @@ class BrowserEnvironment:
             profile_root = Path(os.environ.get("GLADOS_BROWSER_PROFILE_DIR", "").strip() or tempfile.gettempdir())
             profile_root.mkdir(parents=True, exist_ok=True)
             self.profile = Path(tempfile.mkdtemp(prefix="glados-chromium-", dir=profile_root))
-        options: dict[str, Any] = {
-            "user_data_dir": str(self.profile),
-            "executable_path": self.executable,
-            "headless": self.headless,
-            "args": chromium_launch_args(),
-            "viewport": {"width": 1366, "height": 900},
-        }
+        port = _free_port()
+        command = [
+            self.executable,
+            f"--user-data-dir={self.profile}",
+            f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
+            "--window-size=1366,900",
+            *chromium_launch_args(),
+        ]
+        if self.headless:
+            command.append("--headless=new")
         if self.user_agent:
-            options["user_agent"] = self.user_agent
+            command.append(f"--user-agent={self.user_agent}")
         browser_proxy = _browser_proxy(self.proxy)
         if browser_proxy:
-            options["proxy"] = browser_proxy
+            command.append(f"--proxy-server={browser_proxy['server']}")
+        command.append("about:blank")
+        launch_env = os.environ.copy()
+        display = browser_display()
+        if display and not self.headless:
+            launch_env["DISPLAY"] = display
+            self.log(f"浏览器打开在桌面屏幕 {display}")
         try:
+            self._process = subprocess.Popen(
+                command,
+                env=launch_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            _wait_for_cdp(port)
             self.manager = sync_playwright().start()
-            self.context = self.manager.chromium.launch_persistent_context(**options)
+            self.browser = self.manager.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            self.context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
             self.context.set_default_timeout(20_000)
             self.context.set_default_navigation_timeout(60_000)
             self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-            mode = "无头" if self.headless else "有头 Xvfb"
-            self.log(f"浏览器环境已启动（{mode}，{proxy_label(self.proxy)}，浏览器 {Path(self.executable).name}）")
+            mode = "无头" if self.headless else f"桌面 {display or '当前屏幕'}"
+            self.log(f"系统 Chromium 已启动（{mode}，{proxy_label(self.proxy)}，浏览器 {Path(self.executable).name}）")
         except Exception as exc:  # pragma: no cover - depends on host Chromium
             self.close()
             raise BrowserEnvironmentError(f"启动原生 Chromium 失败：{exc}") from exc
 
     def close(self) -> None:
-        if self.context is not None:
+        if self.browser is not None:
             try:
-                self.context.close()
+                self.browser.close()
             except Exception:
                 pass
         if self.manager is not None:
@@ -320,7 +374,21 @@ class BrowserEnvironment:
                 self.manager.stop()
             except Exception:
                 pass
-        self.manager = self.context = self.page = None
+        process = self._process
+        self._process = None
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except OSError:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    process.kill()
+        self.manager = self.browser = self.context = self.page = None
         if self.profile is not None and not self._keep_profile:
             shutil.rmtree(self.profile, ignore_errors=True)
         self.profile = None
@@ -426,12 +494,14 @@ class BrowserEnvironment:
         return any(clue in text or clue in title for clue in clues)
 
     def _clear_page_challenge(self, domain: str) -> None:
-        if not self._page_looks_like_challenge() and not has_turnstile_widget(self.page):
+        if not self._page_looks_like_challenge():
             return
-        self.log(f"{domain} 出现 Cloudflare 验证，等待 Chromium 通过")
+        self.log(f"{domain} 出现整页 Cloudflare 验证，等待 Chromium 通过")
         deadline = time.monotonic() + 45
-        if self._page_looks_like_challenge() and has_turnstile_widget(self.page):
+        try:
             wait_for_turnstile(self.page, timeout=40, log=self.log)
+        except VerificationError:
+            pass
         while time.monotonic() < deadline:
             if not self._page_looks_like_challenge():
                 self.log("Cloudflare 页面验证已通过")

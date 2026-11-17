@@ -22,6 +22,7 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 PrivateTmp=true
+BindPaths=/tmp/.X11-unix
 ProtectHome=true
 NoNewPrivileges=true
 

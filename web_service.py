@@ -478,6 +478,7 @@ class LoginManager:
             )
             try:
                 self._thread.start()
+                self._login_log(f"开始重新登录 {normalized_email} @ {normalized_origin}")
             except Exception:
                 self._state["state"] = "failed"
                 self._state["error"] = "未能启动重新登录"

@@ -23,7 +23,7 @@ from glados import (
     parse_checkin,
     to_int,
 )
-from turnstile import VerificationError, security_method_name, wait_for_turnstile
+from turnstile import VerificationError, wait_for_turnstile
 
 
 logger = logging.getLogger(__name__)
@@ -116,11 +116,10 @@ class BrowserAPI:
                     self.log(LogEmoji.WARNING, f"签到按钮常规点击受阻，改用页面按钮事件重试：{exc}", True)
                     button.click(timeout=15_000, force=True)
 
-            self.log(LogEmoji.INFO, f"本浏览器只点一次 Security：{security_method_name(self.security_method)}", True)
+            self.log(LogEmoji.INFO, "在当前桌面浏览器里点击画面上的 Security，并轮询等待通过", True)
             token = wait_for_turnstile(
                 page,
                 timeout=40,
-                method_index=self.security_method,
                 log=lambda message: self.log(LogEmoji.INFO, message, True),
             )
             self.log(LogEmoji.CHECKIN, f"Security 已通过（token 长度 {len(token)}），点击 Check-in")
@@ -246,7 +245,7 @@ class BrowserCheckinRunner:
                 return
             except (BrowserEnvironmentError, VerificationError) as exc:
                 last_error = str(exc)
-                entry.log(entry.origin or UNPROBED, LogEmoji.WARNING, f"本浏览器环境失败，关闭后换下一个：{exc}", True)
+                entry.log(entry.origin or UNPROBED, LogEmoji.WARNING, f"本浏览器环境失败，关闭后换下一个代理：{exc}", True)
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
                 logger.exception("账号 %s 在浏览器签到时出现未预期异常", entry.label)
@@ -274,7 +273,7 @@ class BrowserCheckinRunner:
                 entry.result = CheckinResult(domain=domain, days=days)
                 entry.result.note = "运行超时，已跳过签到"
             else:
-                api = BrowserAPI(environment, domain, entry, self.config.verbose, security_method=0)
+                api = BrowserAPI(environment, domain, entry, self.config.verbose)
                 entry.result = entry._sign_in(api, domain, days, self.config)
                 if entry.result is not None and entry.result.code in (0, 1):
                     try:
