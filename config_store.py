@@ -19,7 +19,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "verbose": False,
     # Cloud deployments default to Chromium headless; headed-xvfb is for diagnostics.
     "browser_mode": "headless",
-    "base_urls": "",
+    "base_urls": "glados.cloud",
     "scheduler": {"enabled": False, "time": "01:10", "timezone": "Asia/Shanghai"},
 }
 

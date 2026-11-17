@@ -29,7 +29,10 @@
     .account-list { display:grid; gap:12px; } .account-card { background:var(--card2); border:1px solid var(--line); border-radius:10px; padding:12px; }
     .card-head { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:4px; } .card-title { display:flex; align-items:center; gap:8px; min-width:0; cursor:pointer; flex:1; }
     .enabled { width:17px; height:17px; accent-color:var(--green); } .account-index { color:var(--muted); font-size:12px; } .account-summary { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .account-card.collapsed .card-details { display:none; } .collapse-toggle { min-width:58px; }
+    .account-card.collapsed .card-details { display:none; }
+    .cache-badge { flex:none; font-size:12px; font-weight:700; border-radius:999px; padding:2px 8px; white-space:nowrap; }
+    .cache-badge.ready { color:#17200d; background:var(--green); }
+    .cache-badge.empty { color:var(--red); border:1px solid var(--red); }
     .card-grid { display:grid; grid-template-columns:1fr 1fr; gap:0 10px; }.card-grid .wide { grid-column:1 / -1; }
     .cookie { min-height:105px; }.user-agent { min-height:62px; }
     .result { display:none; margin-top:10px; padding:7px 9px; border-radius:7px; font-size:12px; border:1px solid var(--line); } .result.show { display:block; }.result.success,.result.repeat { color:var(--green2); border-color:rgba(145,209,140,.45); }.result.failure { color:var(--red); border-color:rgba(241,158,157,.45); }
@@ -68,7 +71,7 @@
       <h2 style="margin-top:18px">签到选项</h2>
       <label class="switch"><input id="auto-exchange" type="checkbox" checked /> 到期自动兑换积分</label>
       <label for="exchange-days">触发兑换的剩余天数</label><input id="exchange-days" type="number" min="0" step="0.5" value="1" />
-      <label for="base-urls">自定义 GLaDOS 域名（可选，逗号或分号分隔）</label><input id="base-urls" type="text" placeholder="glados.cloud, railgun.info" />
+      <label for="base-urls">自定义 GLaDOS 域名（可选，逗号或分号分隔）</label><input id="base-urls" type="text" value="glados.cloud" placeholder="glados.cloud" />
       <label for="proxies">公共代理池（每行一条；未给账号指定代理时轮换使用）</label>
       <textarea id="proxies" placeholder="http://user:password@host:port"></textarea>
       <div class="hint">单个账号可在账号卡中填专属代理；否则按公共代理池轮换。代理失败不会回退到云服务器直连。原生 Chromium 支持 HTTP(S) 代理及无认证 socks5:// 代理。</div>
@@ -130,9 +133,9 @@
     function input(type, value = '') { const el = document.createElement('input'); el.type = type; el.value = value || ''; return el; }
     function field(labelText, control, wide = false) { const box = document.createElement('div'); if (wide) box.className = 'wide'; const label = document.createElement('label'); label.textContent = labelText; box.append(label, control); return box; }
 
-    function setCardCollapsed(card, collapsed) { const toggle = card.querySelector('[data-collapse]'); card.classList.toggle('collapsed', collapsed); if (toggle) { toggle.textContent = collapsed ? '展开' : '收起'; toggle.setAttribute('aria-expanded', String(!collapsed)); } }
-    function cacheLabel(card) { return card.dataset.cache === 'ready' ? '独立缓存已建立' : '独立缓存未建立'; }
-    function updateCardSummary(card, result) { const summary = card.querySelector('[data-summary]'); if (!summary) return; const cache = cacheLabel(card); if (!result) { summary.textContent = `未执行 · ${cache}`; return; } const icon = result.status === 'success' ? '✅ 成功' : result.status === 'repeat' ? '🔄 已签到' : '❌ 失败'; summary.textContent = `${icon} · ${result.domain || '未知域名'} · ${cache}${result.note ? ` · ${result.note}` : ''}`; }
+    function setCardCollapsed(card, collapsed) { card.classList.toggle('collapsed', collapsed); }
+    function updateCacheBadge(card) { const badge = card.querySelector('[data-cache-badge]'); if (!badge) return; const ready = card.dataset.cache === 'ready'; badge.className = `cache-badge ${ready ? 'ready' : 'empty'}`; badge.textContent = ready ? '缓存已建立' : '缓存未建立'; }
+    function updateCardSummary(card, result) { const summary = card.querySelector('[data-summary]'); updateCacheBadge(card); if (!summary) return; if (!result) { summary.textContent = '未执行'; return; } const icon = result.status === 'success' ? '✅ 成功' : result.status === 'repeat' ? '🔄 已签到' : '❌ 失败'; summary.textContent = `${icon} · ${result.domain || '未知域名'}${result.note ? ` · ${result.note}` : ''}`; }
     function createAccountCard(account, number) {
       const card = document.createElement('article'); card.className = 'account-card'; card.dataset.id = account.id; card.dataset.cache = account.browser_cache ? 'ready' : 'empty';
       const configured = !!String(account.cookie || '').trim(); setCardCollapsed(card, configured);
@@ -142,13 +145,13 @@
       const index = document.createElement('span'); index.className = 'account-index'; index.textContent = `账号 ${number}`;
       const nameHead = document.createElement('strong'); nameHead.textContent = account.name || '未命名账号'; nameHead.dataset.nameTitle = '';
       const summary = document.createElement('span'); summary.className = 'account-summary'; summary.dataset.summary = '';
-      title.append(enabled, index, nameHead, summary); head.append(title);
+      const cacheBadge = document.createElement('span'); cacheBadge.dataset.cacheBadge = '';
+      title.append(enabled, index, nameHead, cacheBadge, summary); head.append(title);
       const buttons = document.createElement('div'); buttons.className = 'actions';
-      const collapse = document.createElement('button'); collapse.type = 'button'; collapse.className = 'ghost small collapse-toggle'; collapse.dataset.collapse = ''; collapse.addEventListener('click', () => setCardCollapsed(card, !card.classList.contains('collapsed')));
       const run = document.createElement('button'); run.type = 'button'; run.className = 'ghost small'; run.dataset.action = 'checkin'; run.textContent = '单独签到'; run.addEventListener('click', () => runOne(account.id));
       const relogin = document.createElement('button'); relogin.type = 'button'; relogin.className = 'ghost small'; relogin.dataset.action = 'relogin'; relogin.textContent = '重新登录'; relogin.addEventListener('click', (event) => { event.stopPropagation(); sendRelogin(card); });
-      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger small'; remove.textContent = '－ 删除'; remove.addEventListener('click', () => { card.remove(); renumber(); });
-      buttons.append(collapse, run, relogin, remove); head.append(buttons); card.append(head);
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger small'; remove.textContent = '删除'; remove.addEventListener('click', () => { card.remove(); renumber(); });
+      buttons.append(run, relogin, remove); head.append(buttons); card.append(head);
       title.addEventListener('click', event => { if (!event.target.closest('input,button')) setCardCollapsed(card, !card.classList.contains('collapsed')); });
       const details = document.createElement('div'); details.className = 'card-details';
       const grid = document.createElement('div'); grid.className = 'card-grid';
@@ -258,7 +261,7 @@
       const panel = card.querySelector('[data-relogin-panel]'); if (!panel) return;
       const active = reloginState.account_id === card.dataset.id;
       const phase = active ? reloginState.state : 'idle';
-      if (active && phase !== 'idle') { panel.hidden = false; setCardCollapsed(card, false); }
+      if (active && ['opening', 'awaiting_code', 'submitting'].includes(phase)) { panel.hidden = false; setCardCollapsed(card, false); }
       const waiting = phase === 'awaiting_code' || phase === 'submitting';
       panel.querySelector('[data-relogin-confirm]').hidden = !waiting;
       panel.querySelector('[data-relogin-cancel]').hidden = !(phase === 'opening' || waiting);
@@ -304,7 +307,7 @@
     async function cancelRelogin() { try { await request('/api/relogin/cancel', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     function setBrowserMode(mode) { $('mode-headed').classList.toggle('active', mode === 'headed-xvfb'); $('mode-headless').classList.toggle('active', mode === 'headless'); }
     $('mode-headed').onclick = () => setBrowserMode('headed-xvfb'); $('mode-headless').onclick = () => setBrowserMode('headless');
-    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || ''; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
+    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || 'glados.cloud'; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
     $('add-account').addEventListener('click', () => { const root = $('accounts'); root.append(createAccountCard(newAccount(), root.children.length + 1)); });
     $('collapse-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, true));
     $('expand-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, false));
