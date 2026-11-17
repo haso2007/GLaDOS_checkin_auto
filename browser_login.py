@@ -57,8 +57,15 @@ class LoginBrowser:
 
     def send_code(self) -> None:
         self._raise_if_cancelled()
-        self.environment.open_url(f"https://{self.domain}/")
+        self.environment.open_url(f"https://{self.domain}/login")
         self._watch_responses()
+        page = self.environment.page
+        if page is not None and "/console" in str(page.url or "") and not self._wait_for_email(2):
+            self.log("当前已登录，重新登录前清除该站点 Cookie")
+            if self.environment.context is not None:
+                self.environment.context.clear_cookies()
+            self.environment.open_url(f"https://{self.domain}/login")
+            self.log(f"当前页面 {self.environment.page.url if self.environment.page else ''}")
         if not self._wait_for_email(8):
             self._click_text(("登录", "Login", "Sign in"))
             if not self._wait_for_email(8):

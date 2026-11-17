@@ -14,6 +14,7 @@ from typing import Any
 DEFAULT_CONFIG: dict[str, Any] = {
     "accounts": [],
     "proxies_text": "",
+    "proxy_mode": "direct",
     "auto_exchange": True,
     "auto_exchange_left_days": 1,
     "verbose": False,
@@ -131,7 +132,7 @@ class ConfigStore:
             "enabled": bool(item.get("enabled", True)),
             "name": str(item.get("name") or "").strip(),
             "email": str(item.get("email") or "").strip(),
-            "origin": str(item.get("origin") or "").strip(),
+            "origin": str(item.get("origin") or "glados.cloud").strip(),
             "cookie": str(item.get("cookie") or "").strip(),
             "user_agent": " ".join(str(item.get("user_agent") or item.get("user-agent") or "").split()),
             "proxy": str(item.get("proxy") or "").strip(),
@@ -142,6 +143,10 @@ class ConfigStore:
         result = copy.deepcopy(DEFAULT_CONFIG)
         result["accounts"] = [self._normalize_account(item) for item in source.get("accounts", []) if isinstance(item, dict)]
         result["proxies_text"] = str(source.get("proxies_text") or "")
+        proxy_mode = str(source.get("proxy_mode") or "").strip()
+        if proxy_mode not in {"direct", "pool"}:
+            proxy_mode = "pool" if result["proxies_text"].strip() else "direct"
+        result["proxy_mode"] = proxy_mode
         result["auto_exchange"] = bool(source.get("auto_exchange", True))
         try:
             result["auto_exchange_left_days"] = max(0, float(source.get("auto_exchange_left_days", 1)))

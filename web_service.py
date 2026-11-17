@@ -18,7 +18,14 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from browser_checkin import AccountRunMeta, BrowserCheckinRunner
-from browser_env import BrowserEnvironmentError, normalize_proxy, parse_proxy_lines
+from browser_env import BrowserEnvironmentError, parse_proxy_lines
+
+
+def configured_proxies(config: dict[str, Any]) -> list[str]:
+    """Return the shared proxy pool, or none when the operator chose a direct connection."""
+    if str(config.get("proxy_mode") or "direct") != "pool":
+        return []
+    return parse_proxy_lines(config.get("proxies_text", ""))
 from browser_login import (
     CODE_WAIT_SECONDS,
     CodeRejected,
@@ -215,7 +222,7 @@ class JobManager:
             }
             runner = BrowserCheckinRunner(
                 runtime,
-                proxies=parse_proxy_lines(config_data.get("proxies_text", "")),
+                proxies=configured_proxies(config_data),
                 account_meta=account_meta,
                 headless=bool(config_data.get("browser_headless", False)),
                 local_only=local_only or bool(config_data.get("browser_local", False)),
@@ -409,6 +416,9 @@ class LoginManager:
     def cancel(self) -> None:
         self._cancel.set()
         self._code_event.set()
+        browser = self._browser
+        if browser is not None:
+            browser.close()
 
     def _run(self, account: dict[str, Any], email: str, origin: str, headless: bool) -> None:
         browser: LoginBrowser | None = None
@@ -474,12 +484,9 @@ class LoginManager:
             self._attempt_event.set()
 
     def _proxies(self, account: dict[str, Any]) -> list[str]:
-        dedicated = str(account.get("proxy") or "").strip()
-        if dedicated:
-            return [normalize_proxy(dedicated)]
+        del account
         config = self.store.load()
-        proxies = parse_proxy_lines(config.get("proxies_text", ""))
-        return proxies or [""]
+        return configured_proxies(config) or [""]
 
     def _set(self, state: str, error: str = "") -> None:
         with self._lock:

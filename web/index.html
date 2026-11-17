@@ -15,7 +15,7 @@
     .actions,.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
     main { max-width:1420px; margin:auto; display:grid; grid-template-columns:minmax(360px, .9fr) minmax(480px, 1.4fr); gap:16px; padding:16px; }
     .full { grid-column:1 / -1; } section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:15px; }
-    label { display:block; margin:10px 0 4px; color:var(--muted); font-size:12px; } input,textarea { width:100%; color:var(--text); background:#0e130d; border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
+    label { display:block; margin:10px 0 4px; color:var(--muted); font-size:12px; } input,textarea,select { width:100%; color:var(--text); background:#0e130d; border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
     textarea { min-height:92px; resize:vertical; font-family:ui-monospace,Consolas,monospace; font-size:12px; }
     input:focus,textarea:focus { outline:2px solid rgba(201,238,105,.3); border-color:var(--green); }
     button { color:#17200d; background:var(--green); border:0; border-radius:8px; padding:8px 12px; font-weight:700; cursor:pointer; } button:hover { filter:brightness(1.08); } button:disabled { opacity:.55; cursor:not-allowed; }
@@ -64,17 +64,18 @@
         <button id="mode-headless" class="filter-btn" type="button">无头</button>
         <button id="mode-local" class="filter-btn" type="button">本地浏览器</button>
       </div>
-      <label class="switch"><input id="local-use-account-proxy" type="checkbox" /> 本机浏览器沿用账号代理</label>
-      <div class="hint">本地浏览器模式：直接在本机 Edge/Chrome 弹出窗口签到，默认走 Windows/Clash 系统网络，避免 Clash TUN 与账号代理嵌套。勾选后才沿用账号专属/公共代理。</div>
-      <div class="hint">NAS 上的有头模式显示在容器内的虚拟屏幕，不会出现在你的电脑上。切换后直接重新签到即可。</div>
-      <div class="hint">若签到提示登录设备不匹配，用账号卡上的「重新登录」。验证码在这个页面输入，容器浏览器会用新会话覆盖该账号的 Cookie。这次登录只服务于容器签到。</div>
+      <label class="switch"><input id="local-use-account-proxy" type="checkbox" /> 本机浏览器使用公共代理池</label>
+      <div class="hint">本地浏览器模式：直接在本机 Edge/Chrome 弹出窗口签到，默认走系统网络。勾选后才使用上面的公共代理池。</div>
+      <div class="hint">程序分支：master（容器部署）</div>
+      <div class="hint">原生 Chromium 默认无头运行。若需要诊断 Cloudflare/Turnstile，可切换有头（Xvfb）；窗口仅存在于服务器虚拟显示器，不会对外暴露。</div>
+      <div class="hint">若签到提示登录设备不匹配，用账号卡上的「重新登录」。验证码在这个页面输入，同一台服务器上的 Chromium 会用新会话覆盖该账号的 Cookie。</div>
       <h2 style="margin-top:18px">签到选项</h2>
       <label class="switch"><input id="auto-exchange" type="checkbox" checked /> 到期自动兑换积分</label>
       <label for="exchange-days">触发兑换的剩余天数</label><input id="exchange-days" type="number" min="0" step="0.5" value="1" />
       <label for="base-urls">自定义 GLaDOS 域名（可选，逗号或分号分隔）</label><input id="base-urls" type="text" placeholder="glados.cloud, railgun.info" />
-      <label for="proxies">公共代理池（每行一条；未给账号指定代理时轮换使用）</label>
-      <textarea id="proxies" placeholder="http://user:password@host:port"></textarea>
-      <div class="hint">单个账号可在账号卡中填专属代理；否则按公共代理池轮换。代理失败不会回退到容器直连。</div>
+      <div class="row" style="justify-content:space-between;align-items:center;margin-top:10px"><label for="proxy-mode" style="margin:0">公共代理池</label><select id="proxy-mode" style="width:160px"><option value="direct">直连</option><option value="pool">代理池</option></select></div>
+      <textarea id="proxies" placeholder="http://user:password@host:port&#10;socks5://user:password@host:port"></textarea>
+      <div class="hint">每行一条。选择代理池时，所有账号按列表轮换，代理失败不会回退到容器直连。选择直连时不使用下面的列表。支持 HTTP(S) 代理，以及带认证或不带认证的 socks5:// 代理。</div>
     </section>
 
     <section>
@@ -85,6 +86,7 @@
         <div class="row" style="margin-top:8px"><button id="import-accounts" type="button">导入到账号列表</button><button id="import-cancel" class="ghost" type="button">取消</button><span id="import-result" class="muted"></span></div>
         <div class="muted" style="margin-top:7px">重复的完整 Cookie 会跳过，已有账号及其名称、域名、代理和未保存修改均保留。导入后请点击“保存配置”持久化。</div>
       </div>
+      <label for="login-origin">登录域名（可选）</label><input id="login-origin" type="text" value="glados.cloud" placeholder="glados.cloud" />
       <div id="accounts" class="account-list" style="margin-top:12px"></div>
     </section>
 
@@ -130,6 +132,7 @@
 
     function newId() { return crypto.randomUUID ? crypto.randomUUID() : `account-${Date.now()}-${Math.random().toString(16).slice(2)}`; }
     function newAccount() { return {id:newId(), enabled:true, name:'', email:'', origin:'', cookie:'', user_agent:'', proxy:''}; }
+    function sharedLoginOrigin() { const value = ($('login-origin').value || '').trim(); return value || 'glados.cloud'; }
     function input(type, value = '') { const el = document.createElement('input'); el.type = type; el.value = value || ''; return el; }
     function field(labelText, control, wide = false) { const box = document.createElement('div'); if (wide) box.className = 'wide'; const label = document.createElement('label'); label.textContent = labelText; box.append(label, control); return box; }
 
@@ -147,21 +150,19 @@
       title.append(enabled, index, nameHead, summary); head.append(title);
       const buttons = document.createElement('div'); buttons.className = 'actions';
       const collapse = document.createElement('button'); collapse.type = 'button'; collapse.className = 'ghost small collapse-toggle'; collapse.dataset.collapse = ''; collapse.addEventListener('click', () => setCardCollapsed(card, !card.classList.contains('collapsed')));
-      const run = document.createElement('button'); run.type = 'button'; run.className = 'ghost small'; run.dataset.action = 'checkin'; run.textContent = '单独签到'; run.addEventListener('click', () => runOne(account.id));
+      const run = document.createElement('button'); run.type = 'button'; run.className = 'small'; run.dataset.action = 'checkin'; run.textContent = '单独签到'; run.addEventListener('click', () => runOne(account.id));
       const localRun = document.createElement('button'); localRun.type = 'button'; localRun.className = 'ghost small'; localRun.dataset.action = 'checkin-local'; localRun.textContent = '本机浏览器签到'; localRun.addEventListener('click', () => runOneLocal(account.id));
-      const relogin = document.createElement('button'); relogin.type = 'button'; relogin.className = 'ghost small'; relogin.dataset.action = 'relogin'; relogin.textContent = '重新登录'; relogin.addEventListener('click', () => openRelogin(card));
-      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger small'; remove.textContent = '－ 删除'; remove.addEventListener('click', () => { card.remove(); renumber(); });
-      buttons.append(collapse, run, localRun, relogin, remove); head.append(buttons); card.append(head);
+      const relogin = document.createElement('button'); relogin.type = 'button'; relogin.className = 'danger small'; relogin.dataset.action = 'relogin'; relogin.textContent = '重新登录'; relogin.addEventListener('click', () => openRelogin(card));
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger small'; remove.textContent = '删除'; remove.addEventListener('click', () => { card.remove(); renumber(); });
+      buttons.append(run, localRun, relogin, remove); head.append(buttons); card.append(head);
       title.addEventListener('click', event => { if (!event.target.closest('input,button')) setCardCollapsed(card, !card.classList.contains('collapsed')); });
       const details = document.createElement('div'); details.className = 'card-details';
       const grid = document.createElement('div'); grid.className = 'card-grid';
       const name = input('text', account.name); name.placeholder = '备注名，例如主号'; name.dataset.field = 'name'; name.addEventListener('input', () => nameHead.textContent = name.value.trim() || '未命名账号');
       const email = input('text', account.email); email.placeholder = '重新登录时使用的邮箱'; email.dataset.field = 'email'; email.autocomplete = 'off';
-      const origin = input('text', account.origin); origin.placeholder = 'glados.cloud（不填自动探测）'; origin.dataset.field = 'origin';
-      const proxy = input('text', account.proxy); proxy.placeholder = '留空使用公共代理池'; proxy.dataset.field = 'proxy';
       const cookie = document.createElement('textarea'); cookie.className = 'cookie'; cookie.placeholder = '粘贴完整 Cookie，必须包含 gld:sess= 或 koa:sess='; cookie.value = account.cookie || ''; cookie.dataset.field = 'cookie';
       const ua = document.createElement('textarea'); ua.className = 'user-agent'; ua.placeholder = '可选：仅用于设备不匹配诊断；Camoufox 会管理自身指纹'; ua.value = account.user_agent || ''; ua.dataset.field = 'user_agent';
-      grid.append(field('账号名称', name), field('登录邮箱（重新登录）', email), field('登录域名（可选）', origin), field('专属代理（可选）', proxy), field('Cookie', cookie, true), field('User-Agent（可选）', ua, true));
+      grid.append(field('账号名称', name), field('登录邮箱（重新登录）', email), field('Cookie', cookie, true), field('User-Agent（可选）', ua, true));
       details.append(grid, createReloginPanel());
       const result = document.createElement('div'); result.className = 'result'; result.dataset.result = ''; details.append(result); card.append(details);
       showAccountResult(card, accountResults.get(account.id));
@@ -171,7 +172,7 @@
 
     function renderAccounts(accounts) { const root = $('accounts'); root.textContent = ''; (accounts.length ? accounts : [newAccount()]).forEach((account, i) => root.append(createAccountCard(account, i + 1))); }
     function renumber() { [...document.querySelectorAll('.account-card')].forEach((card, i) => card.querySelector('.account-index').textContent = `账号 ${i + 1}`); }
-    function collectAccounts() { return [...document.querySelectorAll('.account-card')].map(card => { const value = {id:card.dataset.id}; card.querySelectorAll('[data-field]').forEach(el => value[el.dataset.field] = el.type === 'checkbox' ? el.checked : el.value.trim()); return value; }); }
+    function collectAccounts() { const origin = sharedLoginOrigin(); return [...document.querySelectorAll('.account-card')].map(card => { const value = {id:card.dataset.id, origin, proxy:''}; card.querySelectorAll('[data-field]').forEach(el => value[el.dataset.field] = el.type === 'checkbox' ? el.checked : el.value.trim()); return value; }); }
     function normalizeImportedOrigin(value) { return String(value || '').trim().replace(/^https?:\/\//i, '').split('/')[0].toLowerCase(); }
     function accountFromImport(item) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('JSON 中每个账号必须是对象');
@@ -217,7 +218,7 @@
       result.style.color = added.length ? 'var(--green2)' : 'var(--yellow)';
     }
     function browserMode() { return $('mode-local').classList.contains('active') ? 'local' : $('mode-headless').classList.contains('active') ? 'headless' : 'headed'; }
-    function collectConfig() { const mode = browserMode(); return {accounts:collectAccounts(), proxies_text:$('proxies').value, auto_exchange:$('auto-exchange').checked, auto_exchange_left_days:$('exchange-days').value, verbose:false, browser_headless:mode === 'headless', browser_local:mode === 'local', local_browser_use_account_proxy:$('local-use-account-proxy').checked, base_urls:$('base-urls').value, scheduler:{enabled:$('schedule-enabled').checked, time:$('schedule-time').value || '01:10', timezone:'Asia/Shanghai'}}; }
+    function collectConfig() { const mode = browserMode(); return {accounts:collectAccounts(), proxies_text:$('proxies').value, proxy_mode:$('proxy-mode').value === 'pool' ? 'pool' : 'direct', auto_exchange:$('auto-exchange').checked, auto_exchange_left_days:$('exchange-days').value, verbose:false, browser_headless:mode === 'headless', browser_local:mode === 'local', local_browser_use_account_proxy:$('local-use-account-proxy').checked, base_urls:$('base-urls').value, scheduler:{enabled:$('schedule-enabled').checked, time:$('schedule-time').value || '01:10', timezone:'Asia/Shanghai'}}; }
 
     async function request(url, options = {}) { const res = await fetch(url, options); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.detail || `请求失败 (${res.status})`); return body; }
     function setStatus(text, error = false) { const node = $('status'); node.textContent = text; node.style.color = error ? 'var(--red)' : ''; }
@@ -300,7 +301,7 @@
     async function cancelRelogin() { try { await request('/api/relogin/cancel', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     function setBrowserMode(mode) { $('mode-headed').classList.toggle('active', mode === 'headed'); $('mode-headless').classList.toggle('active', mode === 'headless'); $('mode-local').classList.toggle('active', mode === 'local'); }
     $('mode-headed').onclick = () => setBrowserMode('headed'); $('mode-headless').onclick = () => setBrowserMode('headless'); $('mode-local').onclick = () => setBrowserMode('local');
-    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || ''; $('local-use-account-proxy').checked = !!config.local_browser_use_account_proxy; setBrowserMode(config.browser_local ? 'local' : config.browser_headless ? 'headless' : 'headed'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
+    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('proxy-mode').value = config.proxy_mode === 'pool' ? 'pool' : 'direct'; const sharedOrigin = (config.accounts || []).map(item => String(item.origin || '').trim()).find(Boolean) || 'glados.cloud'; $('login-origin').value = sharedOrigin; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || ''; $('local-use-account-proxy').checked = !!config.local_browser_use_account_proxy; setBrowserMode(config.browser_local ? 'local' : config.browser_headless ? 'headless' : 'headed'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
     $('add-account').addEventListener('click', () => { const root = $('accounts'); root.append(createAccountCard(newAccount(), root.children.length + 1)); });
     $('collapse-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, true));
     $('expand-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, false));
