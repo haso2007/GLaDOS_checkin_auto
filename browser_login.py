@@ -72,6 +72,14 @@ class LoginBrowser:
             if self._email_box(2) is not None:
                 opened = True
                 break
+            if self._already_inside():
+                self._drop_site_session()
+                self.log("重新打开登录页")
+                self.environment.open_url(f"https://{self.domain}/login")
+                self.log(f"当前页面 {self._page().url}")
+                if self._email_box(8) is not None:
+                    opened = True
+                    break
             self.log("这一页没有邮箱框，尝试点开登录入口")
             if self._click_labels(_LOGIN_LABELS) and self._email_box(8) is not None:
                 opened = True
@@ -268,6 +276,17 @@ class LoginBrowser:
                 except Exception as exc:
                     self.log(f"点击失败，换下一个控件：{exc}")
         return False
+
+    def _already_inside(self) -> bool:
+        url = str(self._page().url or "")
+        return "/console" in url or "/dashboard" in url
+
+    def _drop_site_session(self) -> None:
+        context = self.environment.context
+        if context is None:
+            return
+        self.log("当前已登录，重新登录前清除该站点 Cookie")
+        context.clear_cookies()
 
     def _email_box(self, timeout: float) -> Any | None:
         page = self._page()
