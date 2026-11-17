@@ -326,16 +326,24 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_for_cdp(port: int) -> None:
+def _wait_for_cdp(port: int, process: subprocess.Popen[bytes] | None = None, stderr_path: Path | None = None) -> None:
     deadline = time.monotonic() + 20
     url = f"http://127.0.0.1:{port}/json/version"
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            break
         try:
             with urllib.request.urlopen(url, timeout=0.4) as response:
                 if response.status == 200:
                     return
         except Exception:
             time.sleep(0.25)
+    detail = ""
+    if stderr_path is not None and stderr_path.is_file():
+        lines = stderr_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        detail = " ".join(lines[-4:]).strip()
+    if detail:
+        raise BrowserEnvironmentError(f"Chromium 调试端口没有就绪：{detail[:300]}")
     raise BrowserEnvironmentError("Chromium 调试端口没有就绪")
 
 
@@ -416,6 +424,8 @@ class BrowserEnvironment:
         self.page: Any = None
         self._process: subprocess.Popen[bytes] | None = None
         self._proxy_bridge: _AuthProxyBridge | None = None
+        self._run_tmp: Path | None = None
+        self._stderr_file: Any = None
         self.profile: Path | None = None
         self.exit_ip = ""
         self.executable = ""
@@ -491,17 +501,25 @@ class BrowserEnvironment:
         if display and not self.headless:
             launch_env["DISPLAY"] = display
             self.log(f"浏览器在虚拟屏幕 {display} 上有头运行，不显示到桌面")
+        temp_root = Path(os.environ.get("GLADOS_DATA_DIR", "").strip() or "/var/lib/glados-checkin") / "tmp"
+        self._run_tmp = temp_root / f"run-{port}"
+        self._run_tmp.mkdir(parents=True, exist_ok=True)
+        launch_env["TMPDIR"] = str(self._run_tmp)
+        stderr_path = self._run_tmp / "chromium.log"
+        self._stderr_file = stderr_path.open("w", encoding="utf-8")
         try:
             self._process = subprocess.Popen(
                 command,
                 env=launch_env,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=self._stderr_file,
                 start_new_session=True,
             )
             with BrowserEnvironment._active_lock:
                 BrowserEnvironment._active = self
-            _wait_for_cdp(port)
+            _wait_for_cdp(port, self._process, stderr_path)
+            self._stderr_file.close()
+            self._stderr_file = None
             self.manager = sync_playwright().start()
             self.browser = self.manager.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
             self.context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
@@ -558,8 +576,24 @@ class BrowserEnvironment:
         if self.profile is not None and not self._keep_profile:
             shutil.rmtree(self.profile, ignore_errors=True)
         self.profile = None
+        self._cleanup_runtime_files()
         self._cookie_domains.clear()
         self._opened_domain = ""
+
+    def _cleanup_runtime_files(self) -> None:
+        """Remove this account's browser temporary files before the next account starts."""
+        if self._stderr_file is not None:
+            try:
+                self._stderr_file.close()
+            except Exception:
+                pass
+            self._stderr_file = None
+        if self._run_tmp is not None:
+            shutil.rmtree(self._run_tmp, ignore_errors=True)
+            self._run_tmp = None
+        for path in Path("/tmp").glob("org.chromium.Chromium.*"):
+            shutil.rmtree(path, ignore_errors=True)
+        self.log("已清理本账号的浏览器临时文件")
 
     def save_state(self) -> None:
         if self.state_dir is None:
