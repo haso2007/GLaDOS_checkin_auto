@@ -19,7 +19,7 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
 from browser_checkin import AccountRunMeta, BrowserCheckinRunner
-from browser_env import BrowserEnvironmentError, parse_proxy_lines
+from browser_env import BrowserEnvironment, BrowserEnvironmentError, parse_proxy_lines
 from browser_state import cache_ready, ensure_account_states, state_dir
 from browser_login import (
     CODE_WAIT_SECONDS,
@@ -138,6 +138,7 @@ class JobManager:
         self.gate = gate or BrowserGate()
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
+        self._cancel = threading.Event()
         self._next_log_id = 0
         self._state_store = RuntimeStateStore(store.data_dir, "job_state.json")
         self._state: dict[str, Any] = {
@@ -230,6 +231,7 @@ class JobManager:
                 return False
             if not self.gate.try_acquire("checkin"):
                 return False
+            self._cancel.clear()
             try:
                 if on_accept is not None:
                     on_accept()
@@ -280,6 +282,16 @@ class JobManager:
             return False, 0
         return self.start("重试失败账号", account_ids=failed_ids), len(failed_ids)
 
+    def cancel(self) -> bool:
+        with self._lock:
+            if not self._state["running"]:
+                return False
+            self._state["interrupted"] = True
+        self._cancel.set()
+        logger.info("收到退出请求，正在关闭签到浏览器")
+        BrowserEnvironment.close_active()
+        return True
+
     def _run(
         self,
         reason: str,
@@ -315,8 +327,11 @@ class JobManager:
                 proxies=parse_proxy_lines(config_data.get("proxies_text", "")),
                 account_meta=account_meta,
                 headless=config_data.get("browser_mode", "headless") == "headless",
+                cancelled=self._cancel.is_set,
             )
             report = runner.run()
+            if self._cancel.is_set():
+                logger.info("签到已退出")
             logger.info("========== 签到总结 ==========")
             logger.info("%s", report.title)
             for line in report.render().splitlines():
@@ -511,6 +526,11 @@ class LoginManager:
     def cancel(self) -> None:
         self._cancel.set()
         self._code_event.set()
+        browser = self._browser
+        if browser is not None:
+            browser.close()
+        BrowserEnvironment.close_active()
+        self._login_log("已退出重新登录")
 
     def _run(self, account: dict[str, Any], email: str, origin: str, headless: bool) -> None:
         browser: LoginBrowser | None = None
@@ -753,6 +773,14 @@ def create_app() -> FastAPI:
         except LoginError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, **result}
+
+    @app.post("/api/stop")
+    def stop_running() -> dict[str, Any]:
+        stopped_login = logins.busy()
+        if stopped_login:
+            logins.cancel()
+        stopped_checkin = jobs.cancel()
+        return {"ok": True, "login": stopped_login, "checkin": stopped_checkin}
 
     @app.post("/api/relogin/cancel")
     def cancel_relogin() -> dict[str, Any]:

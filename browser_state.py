@@ -35,7 +35,7 @@ def ensure_account_states(data_dir: Path, account_ids: set[str]) -> None:
 
 def cache_ready(data_dir: Path, account_id: str) -> bool:
     path = state_dir(data_dir, account_id)
-    return (path / "storage_state.json").is_file() and (path / "page_storage.json").is_file()
+    return (path / "user-data-dir").is_dir() or (path / "storage_state.json").is_file()
 
 
 def _ignore_profile_noise(_directory: str, names: list[str]) -> set[str]:
@@ -44,7 +44,7 @@ def _ignore_profile_noise(_directory: str, names: list[str]) -> set[str]:
 
 
 def save_browser_state(environment: Any, directory: Path) -> None:
-    """Persist this browser's cookies, page storage, and profile for the next check-in."""
+    """Persist this browser's cookies and profile. Page storage stays inside the profile."""
     context = environment.context
     page = environment.page
     profile = environment.profile
@@ -52,20 +52,6 @@ def save_browser_state(environment: Any, directory: Path) -> None:
         raise RuntimeError("浏览器未打开，无法保存账号缓存")
     directory.mkdir(parents=True, exist_ok=True)
     context.storage_state(path=str(directory / "storage_state.json"))
-    page_state = page.evaluate(
-        """() => {
-          const dump = (storage) => {
-            const out = {};
-            for (let i = 0; i < storage.length; i += 1) {
-              const key = storage.key(i);
-              out[key] = storage.getItem(key);
-            }
-            return out;
-          };
-          return {url: location.href, localStorage: dump(localStorage), sessionStorage: dump(sessionStorage)};
-        }"""
-    )
-    (directory / "page_storage.json").write_text(json.dumps(page_state, ensure_ascii=False, indent=2), encoding="utf-8")
     if profile is not None and Path(profile).is_dir():
         target = directory / "user-data-dir"
         if Path(profile).resolve() != target.resolve():
@@ -86,19 +72,6 @@ def saved_cookies(directory: Path, domain: str) -> list[dict[str, Any]]:
         item for item in state.get("cookies") or []
         if isinstance(item, dict) and domain in str(item.get("domain") or "")
     ]
-
-
-def saved_page_pairs(directory: Path) -> tuple[list[list[str]], list[list[str]]]:
-    path = directory / "page_storage.json"
-    if not path.is_file():
-        return [], []
-    try:
-        stored = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return [], []
-    local_pairs = [[str(key), str(value)] for key, value in (stored.get("localStorage") or {}).items()]
-    session_pairs = [[str(key), str(value)] for key, value in (stored.get("sessionStorage") or {}).items()]
-    return local_pairs, session_pairs
 
 
 def profile_source(directory: Path) -> Path | None:

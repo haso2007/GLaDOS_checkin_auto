@@ -22,13 +22,12 @@ class NativeRuntimeTests(unittest.TestCase):
         self.assertEqual(store._normalize({"browser_headless": False})["browser_mode"], "headed-xvfb")
         self.assertEqual(store._normalize({"browser_headless": True})["browser_mode"], "headless")
 
-    def test_authenticated_socks_proxy_is_rejected_without_rewrite(self) -> None:
-        with self.assertRaises(ValueError):
-            normalize_proxy("socks5://user:password@127.0.0.1:1080")
-        self.assertEqual(normalize_proxy("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080")
+    def test_authenticated_socks_proxy_is_accepted(self) -> None:
+        self.assertEqual(normalize_proxy("socks5://user:password@127.0.0.1:1080"), "socks5://user:password@127.0.0.1:1080")
+        self.assertEqual(normalize_proxy("socks5h://127.0.0.1:1080"), "socks5://127.0.0.1:1080")
         self.assertEqual(
-            _browser_proxy("socks5://127.0.0.1:1080"),
-            {"server": "socks5://127.0.0.1:1080"},
+            _browser_proxy("socks5://user:password@127.0.0.1:1080"),
+            {"server": "socks5://127.0.0.1:1080", "username": "user", "password": "password"},
         )
 
     def test_account_user_agent_reaches_persistent_chromium_context(self) -> None:
@@ -93,7 +92,7 @@ class NativeRuntimeTests(unittest.TestCase):
                 environment.close()
 
         command = " ".join(str(part) for part in captured["command"])
-        self.assertIn("--user-agent=Agent/1.0", command)
+        self.assertNotIn("--user-agent=", command)
         self.assertIn("--headless=new", command)
         self.assertIn("--user-data-dir=", command)
         self.assertTrue(str(captured["endpoint"]).startswith("http://127.0.0.1:"))

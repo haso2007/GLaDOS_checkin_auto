@@ -97,7 +97,7 @@ EXPIRY_WARN_DAYS = 7
 POINTS_TIMEOUT = (10, 30)
 
 """单次运行总预算（秒）。到期后跳过剩余账号，避免 Actions 长时间挂起"""
-RUN_BUDGET_SECONDS = 300
+RUN_BUDGET_SECONDS = 900
 
 """签到 challenge 的 proof 后缀与最小等待（与网页端当前实现一致）"""
 CHALLENGE_SUFFIX = "glados-observe-v1"

@@ -379,7 +379,7 @@ def _click_turnstile_frame(page: Any, log: Log | None = None) -> bool:
     return False
 
 
-def wait_for_turnstile(page: Any, *, timeout: float = 40.0, log: Log | None = None, method_index: int = 0) -> str:
+def wait_for_turnstile(page: Any, *, timeout: float = 40.0, log: Log | None = None, method_index: int = 0, cancelled: Callable[[], bool] | None = None) -> str:
     """Poll the widget and click its frame again in this same browser until a token appears."""
     del method_index
     rounds = max(8, int(max(timeout, 5.0) / 2))
@@ -387,6 +387,8 @@ def wait_for_turnstile(page: Any, *, timeout: float = 40.0, log: Log | None = No
     clicked = False
     last_click = -100
     for index in range(rounds):
+        if cancelled is not None and cancelled():
+            raise VerificationError("已退出")
         token = read_turnstile_token(page)
         if token:
             if log:
@@ -416,9 +418,9 @@ def wait_for_turnstile(page: Any, *, timeout: float = 40.0, log: Log | None = No
             except Exception:
                 time.sleep(2)
             continue
-        if not clicked or index - last_click >= 6:
+        if not clicked:
             if log:
-                log("点击 Turnstile 复选框" if not clicked else "再次点击 Turnstile 复选框")
+                log("点击 Turnstile 复选框")
             _click_visible_security(page, log, target)
             clicked = True
             last_click = index

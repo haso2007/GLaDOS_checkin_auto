@@ -7,13 +7,16 @@ opens its own Chromium profile and does not share that profile with another acco
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
+import select
 import shutil
 import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -23,7 +26,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
-from browser_state import saved_cookies, saved_page_pairs, save_browser_state
+from browser_state import saved_cookies, save_browser_state
 from turnstile import VerificationError, wait_for_turnstile
 
 
@@ -65,13 +68,11 @@ def normalize_proxy(value: str) -> str:
         scheme = parsed.scheme.lower()
         if not parsed.hostname:
             raise ValueError("无法解析代理地址")
-        if scheme in {"http", "https"}:
+        if scheme in {"http", "https", "socks5"}:
             return text
-        if scheme == "socks5" and parsed.username is None and parsed.password is None:
-            return text
-        if scheme in {"socks", "socks5", "socks5h"}:
-            raise ValueError("当前原生 Chromium 仅支持无认证 socks5:// 代理；请使用 HTTP(S) 认证代理")
-        raise ValueError("仅支持 http://、https:// 或无认证 socks5:// 代理")
+        if scheme in {"socks", "socks5h"}:
+            return text.replace(f"{parsed.scheme}://", "socks5://", 1)
+        raise ValueError("仅支持 http://、https:// 或 socks5:// 代理")
     if "@" in text:
         return f"http://{text}"
     parts = text.split(":")
@@ -115,14 +116,162 @@ def _browser_proxy(proxy: str) -> dict[str, str] | None:
     scheme = (parsed.scheme or "http").lower()
     if scheme not in {"http", "https", "socks5"}:
         raise BrowserEnvironmentError("原生 Chromium 不支持该代理协议")
-    if scheme == "socks5" and (parsed.username is not None or parsed.password is not None):
-        raise BrowserEnvironmentError("原生 Chromium 不支持认证 socks5 代理")
     result = {"server": f"{scheme}://{parsed.hostname}{f':{parsed.port}' if parsed.port else ''}"}
     if parsed.username:
         result["username"] = unquote(parsed.username)
     if parsed.password is not None:
         result["password"] = unquote(parsed.password)
     return result
+
+
+class _AuthProxyBridge:
+    """Local HTTP proxy so Chromium can use an authenticated HTTP or SOCKS5 proxy."""
+
+    def __init__(self, upstream: str) -> None:
+        parsed = urlparse(upstream)
+        if not parsed.hostname or not parsed.port:
+            raise BrowserEnvironmentError("代理地址缺少主机或端口")
+        self._scheme = (parsed.scheme or "http").lower()
+        self._host = parsed.hostname
+        self._port = parsed.port
+        self._user = unquote(parsed.username or "")
+        self._password = unquote(parsed.password or "")
+        token = base64.b64encode(f"{self._user}:{self._password}".encode()).decode()
+        self._auth = f"Basic {token}"
+        self._listen = socket.socket()
+        self._listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listen.bind(("127.0.0.1", 0))
+        self.port = int(self._listen.getsockname()[1])
+        self._listen.listen(32)
+        self._closed = False
+        threading.Thread(target=self._accept, name="glados-proxy-bridge", daemon=True).start()
+
+    def close(self) -> None:
+        self._closed = True
+        try:
+            self._listen.close()
+        except OSError:
+            pass
+
+    def _accept(self) -> None:
+        while not self._closed:
+            try:
+                client, _ = self._listen.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+
+    def _handle(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = client.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+            head, rest = data.split(b"\r\n\r\n", 1)
+            parts = head.decode("latin1").split("\r\n")[0].split(" ")
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                return
+            target = parts[1]
+            host, _, port_text = target.rpartition(":")
+            upstream = self._open_upstream(host, int(port_text or "443"))
+            if self._scheme == "socks5":
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                if rest:
+                    upstream.sendall(rest)
+                self._splice(client, upstream)
+                return
+            request = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: {self._auth}\r\n\r\n"
+            upstream.sendall(request.encode())
+            response = b""
+            while b"\r\n\r\n" not in response:
+                block = upstream.recv(4096)
+                if not block:
+                    break
+                response += block
+            status = response.split(b" ", 2)[1] if response.startswith(b"HTTP/") else b"502"
+            if status != b"200":
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                return
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            if rest:
+                upstream.sendall(rest)
+            self._splice(client, upstream)
+        except Exception:
+            try:
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            except OSError:
+                pass
+        finally:
+            client.close()
+            if upstream is not None:
+                upstream.close()
+
+    def _splice(self, client: socket.socket, upstream: socket.socket) -> None:
+        sockets = [client, upstream]
+        while True:
+            readable, _, _ = select.select(sockets, [], [], 60)
+            if not readable:
+                return
+            for source in readable:
+                payload = source.recv(65536)
+                if not payload:
+                    return
+                (upstream if source is client else client).sendall(payload)
+
+    def _open_upstream(self, host: str, port: int) -> socket.socket:
+        if self._scheme != "socks5":
+            return socket.create_connection((self._host, self._port), 20)
+        sock = socket.create_connection((self._host, self._port), 20)
+        try:
+            self._socks5_connect(sock, host, port)
+        except Exception:
+            sock.close()
+            raise
+        return sock
+
+    def _socks5_connect(self, sock: socket.socket, host: str, port: int) -> None:
+        if self._user:
+            sock.sendall(b"\x05\x01\x02")
+            chosen = self._recvn(sock, 2)
+            if chosen[1] != 2:
+                raise BrowserEnvironmentError("SOCKS5 代理未接受用户名认证")
+            user = self._user.encode()
+            password = self._password.encode()
+            sock.sendall(bytes([1, len(user)]) + user + bytes([len(password)]) + password)
+            verdict = self._recvn(sock, 2)
+            if verdict[1] != 0:
+                raise BrowserEnvironmentError("SOCKS5 代理认证失败")
+        else:
+            sock.sendall(b"\x05\x01\x00")
+            chosen = self._recvn(sock, 2)
+            if chosen[1] != 0:
+                raise BrowserEnvironmentError("SOCKS5 代理未接受无认证连接")
+        host_bytes = host.encode()
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + port.to_bytes(2, "big"))
+        header = self._recvn(sock, 4)
+        if header[1] != 0:
+            raise BrowserEnvironmentError(f"SOCKS5 连接失败，代码 {header[1]}")
+        if header[3] == 1:
+            self._recvn(sock, 6)
+        elif header[3] == 4:
+            self._recvn(sock, 18)
+        elif header[3] == 3:
+            length = self._recvn(sock, 1)[0]
+            self._recvn(sock, length + 2)
+
+    @staticmethod
+    def _recvn(sock: socket.socket, count: int) -> bytes:
+        data = b""
+        while len(data) < count:
+            chunk = sock.recv(count - len(data))
+            if not chunk:
+                raise BrowserEnvironmentError("SOCKS5 代理提前断开")
+            data += chunk
+        return data
 
 
 def probe_exit_ip(proxy: str) -> tuple[str, str]:
@@ -197,10 +346,6 @@ def chromium_launch_args() -> list[str]:
     return [
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-background-networking",
-        "--disable-component-update",
-        "--disable-features=Translate,OptimizationHints",
-        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     ]
 
 
@@ -248,6 +393,9 @@ def smoke_chromium() -> str:
 class BrowserEnvironment:
     """One native Chromium profile for one account. The profile stays on disk."""
 
+    _active: "BrowserEnvironment | None" = None
+    _active_lock = threading.Lock()
+
     def __init__(
         self,
         cookie: str,
@@ -269,6 +417,7 @@ class BrowserEnvironment:
         self.context: Any = None
         self.page: Any = None
         self._process: subprocess.Popen[bytes] | None = None
+        self._proxy_bridge: _AuthProxyBridge | None = None
         self.profile: Path | None = None
         self.exit_ip = ""
         self.executable = ""
@@ -293,19 +442,15 @@ class BrowserEnvironment:
 
         self.executable = chromium_executable()
         if self.proxy:
-            # A proxy account may never silently begin a run on the cloud VM's
-            # direct datacenter IP. Fail before Chromium starts if it is unusable.
+            # Keep the configured proxy even when the exit probe fails. Do not
+            # fall back to the machine's direct address.
             try:
                 self.exit_ip, _ = probe_exit_ip(self.proxy)
                 self.log(f"{proxy_label(self.proxy)}，出口 IP {self.exit_ip}")
             except Exception as exc:
-                raise BrowserEnvironmentError(f"代理出口探测失败，拒绝直连回退：{exc}") from exc
+                self.log(f"{proxy_label(self.proxy)}，出口探测失败，仍通过该代理打开浏览器：{exc}")
         else:
-            try:
-                self.exit_ip, _ = probe_exit_ip("")
-                self.log(f"直连，出口 IP {self.exit_ip}")
-            except Exception as exc:  # pragma: no cover - network-dependent diagnostics
-                self.log(f"直连出口 IP 探测失败：{exc}")
+            self.log("直连，不在打开浏览器前访问 Cloudflare")
 
         if self.state_dir is not None:
             self.profile = self.state_dir / "user-data-dir"
@@ -332,10 +477,16 @@ class BrowserEnvironment:
         if self.headless:
             command.append("--headless=new")
         if self.user_agent:
-            command.append(f"--user-agent={self.user_agent}")
+            self.log("已忽略账号里的 User-Agent，避免和当前 Linux Chromium 不一致")
         browser_proxy = _browser_proxy(self.proxy)
         if browser_proxy:
-            command.append(f"--proxy-server={browser_proxy['server']}")
+            server = browser_proxy["server"]
+            if browser_proxy.get("username"):
+                self._proxy_bridge = _AuthProxyBridge(self.proxy)
+                server = f"http://127.0.0.1:{self._proxy_bridge.port}"
+                kind = "SOCKS5" if browser_proxy["server"].startswith("socks5://") else "HTTP"
+                self.log(f"已为带认证的 {kind} 代理建立本地转发")
+            command.append(f"--proxy-server={server}")
         command.append("about:blank")
         launch_env = os.environ.copy()
         display = browser_display()
@@ -350,6 +501,8 @@ class BrowserEnvironment:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            with BrowserEnvironment._active_lock:
+                BrowserEnvironment._active = self
             _wait_for_cdp(port)
             self.manager = sync_playwright().start()
             self.browser = self.manager.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -363,7 +516,18 @@ class BrowserEnvironment:
             self.close()
             raise BrowserEnvironmentError(f"启动原生 Chromium 失败：{exc}") from exc
 
+    @classmethod
+    def close_active(cls) -> None:
+        """Stop the browser that is currently signing in or logging in."""
+        with cls._active_lock:
+            current = cls._active
+        if current is not None:
+            current.close()
+
     def close(self) -> None:
+        with BrowserEnvironment._active_lock:
+            if BrowserEnvironment._active is self:
+                BrowserEnvironment._active = None
         if self.browser is not None:
             try:
                 self.browser.close()
@@ -374,6 +538,10 @@ class BrowserEnvironment:
                 self.manager.stop()
             except Exception:
                 pass
+        bridge = self._proxy_bridge
+        self._proxy_bridge = None
+        if bridge is not None:
+            bridge.close()
         process = self._process
         self._process = None
         if process is not None and process.poll() is None:
@@ -411,20 +579,6 @@ class BrowserEnvironment:
             return
         self.context.add_cookies(cookies)
         self.log(f"已恢复该账号缓存中的 {len(cookies)} 项 Cookie")
-
-    def _apply_page_storage(self) -> None:
-        if self.state_dir is None or self.page is None:
-            return
-        local_pairs, session_pairs = saved_page_pairs(self.state_dir)
-        if not local_pairs and not session_pairs:
-            return
-        self.page.evaluate(
-            """([localPairs, sessionPairs]) => {
-              for (const [key, value] of localPairs) localStorage.setItem(key, value);
-              for (const [key, value] of sessionPairs) sessionStorage.setItem(key, value);
-            }""",
-            [local_pairs, session_pairs],
-        )
 
     def _install_cookies(self, domain: str) -> None:
         if domain in self._cookie_domains:
@@ -475,9 +629,6 @@ class BrowserEnvironment:
             return
         try:
             self.page.goto(f"https://{domain}/console/checkin", wait_until="domcontentloaded", timeout=60_000)
-            self._apply_page_storage()
-            self.page.reload(wait_until="domcontentloaded", timeout=60_000)
-            self._apply_page_storage()
             self.page.wait_for_timeout(1_000)
         except Exception as exc:
             raise BrowserEnvironmentError(f"打开 {domain} 失败：{exc}") from exc

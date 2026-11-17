@@ -27,8 +27,9 @@
     .switch { display:inline-flex; align-items:center; gap:8px; cursor:pointer; color:var(--text); font-weight:600; } .switch input { width:17px; height:17px; accent-color:var(--green); }
     #schedule-time { width:112px; }
     .account-list { display:grid; gap:12px; } .account-card { background:var(--card2); border:1px solid var(--line); border-radius:10px; padding:12px; }
-    .card-head { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:4px; } .card-title { display:flex; align-items:center; gap:8px; min-width:0; cursor:pointer; flex:1; }
-    .enabled { width:17px; height:17px; accent-color:var(--green); } .account-index { color:var(--muted); font-size:12px; } .account-summary { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .card-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:4px; } .card-title { display:flex; flex-direction:column; align-items:stretch; gap:4px; min-width:0; cursor:pointer; flex:1; } .card-title-row { display:flex; align-items:center; gap:8px; min-width:0; }
+    .enabled { width:17px; height:17px; accent-color:var(--green); flex:none; } .account-index { color:var(--muted); font-size:12px; flex:none; } .card-title strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .account-summary { color:var(--muted); font-size:12px; white-space:normal; overflow-wrap:anywhere; }
+    .card-head .actions { flex:none; }
     .account-card.collapsed .card-details { display:none; }
     .cache-badge { flex:none; font-size:12px; font-weight:700; border-radius:999px; padding:2px 8px; white-space:nowrap; }
     .cache-badge.ready { color:#17200d; background:var(--green); }
@@ -51,7 +52,7 @@
 <body>
   <header>
     <div class="header-title"><h1>🎫 GLaDOS 原生 Chromium 签到</h1><div class="subtitle">每个账号使用独立 Chromium 环境与代理，Cloudflare 验证在真实浏览器中完成。</div></div>
-    <div class="actions header-actions"><span id="status" class="status">加载配置中…</span><button id="save" class="ghost" type="button">保存配置</button><button id="retry-failed" class="ghost" type="button" disabled>重试失败账号</button><button id="run-all" type="button">立即签到全部</button></div>
+    <div class="actions header-actions"><span id="status" class="status">加载配置中…</span><button id="save" class="ghost" type="button">保存配置</button><button id="stop" class="danger" type="button" disabled>退出</button><button id="retry-failed" class="ghost" type="button" disabled>重试失败账号</button><button id="run-all" type="button">立即签到全部</button></div>
   </header>
   <main>
     <section>
@@ -74,7 +75,7 @@
       <label for="base-urls">自定义 GLaDOS 域名（可选，逗号或分号分隔）</label><input id="base-urls" type="text" value="glados.cloud" placeholder="glados.cloud" />
       <label for="proxies">公共代理池（每行一条；未给账号指定代理时轮换使用）</label>
       <textarea id="proxies" placeholder="http://user:password@host:port"></textarea>
-      <div class="hint">所有账号按公共代理池轮换。代理失败不会回退到云服务器直连。原生 Chromium 支持 HTTP(S) 代理及无认证 socks5:// 代理。</div>
+      <div class="hint">所有账号按公共代理池轮换。代理失败不会回退到云服务器直连。支持 HTTP(S) 代理，以及带认证或不带认证的 socks5:// 代理。</div>
     </section>
 
     <section>
@@ -148,7 +149,9 @@
       const nameHead = document.createElement('strong'); nameHead.textContent = account.name || '未命名账号'; nameHead.dataset.nameTitle = '';
       const summary = document.createElement('span'); summary.className = 'account-summary'; summary.dataset.summary = '';
       const cacheBadge = document.createElement('span'); cacheBadge.dataset.cacheBadge = '';
-      title.append(enabled, index, nameHead, cacheBadge, summary); head.append(title);
+      const titleRow = document.createElement('div'); titleRow.className = 'card-title-row';
+      titleRow.append(enabled, index, nameHead, cacheBadge);
+      title.append(titleRow, summary); head.append(title);
       const buttons = document.createElement('div'); buttons.className = 'actions';
       const run = document.createElement('button'); run.type = 'button'; run.className = 'ghost small'; run.dataset.action = 'checkin'; run.textContent = '单独签到'; run.addEventListener('click', () => runOne(account.id));
       const relogin = document.createElement('button'); relogin.type = 'button'; relogin.className = 'ghost small'; relogin.dataset.action = 'relogin'; relogin.textContent = '重新登录'; relogin.addEventListener('click', (event) => { event.stopPropagation(); sendRelogin(card); });
@@ -238,7 +241,7 @@
     async function copyLines(lines) { const text = lines.map(logText).join('\n'); if (!text) { setStatus('没有可复制的日志', true); return; } try { await navigator.clipboard.writeText(text); } catch { const area = document.createElement('textarea'); area.value = text; document.body.append(area); area.select(); document.execCommand('copy'); area.remove(); } setStatus(`已复制 ${lines.length} 条日志`); }
     function taskBusy() { return jobRunning || ['opening', 'awaiting_code', 'submitting'].includes(reloginState.state); }
     function noteLog(message, level = 'INFO') { const now = new Date(); const time = [now.getHours(), now.getMinutes(), now.getSeconds()].map(part => String(part).padStart(2, '0')).join(':'); liveLogs.push({time, level, message}); while (liveLogs.length > 500) liveLogs.shift(); renderLive(); }
-    function refreshActionButtons() { const busy = taskBusy(); $('run-all').disabled = busy; if (busy) $('retry-failed').disabled = true; $('add-account').disabled = busy; document.querySelectorAll('.account-card button[data-action], .account-card button.danger').forEach(button => { button.disabled = busy; }); document.querySelectorAll('.account-card').forEach(updateReloginPanel); }
+    function refreshActionButtons() { const busy = taskBusy(); $('run-all').disabled = busy; $('stop').disabled = !busy; if (busy) $('retry-failed').disabled = true; $('add-account').disabled = busy; document.querySelectorAll('.account-card button[data-action], .account-card button.danger').forEach(button => { button.disabled = busy; }); document.querySelectorAll('.account-card').forEach(updateReloginPanel); }
     function applyJob(job, replace = false) { const failures = (job.results || []).filter(item => item.status === 'failure').length; jobRunning = !!job.running; $('run-all').disabled = jobRunning; $('retry-failed').disabled = jobRunning || !failures; $('retry-failed').textContent = failures ? `重试失败账号 (${failures})` : '重试失败账号'; refreshActionButtons(); const reloginActive = ['opening', 'awaiting_code', 'submitting'].includes(reloginState.state); if (!reloginActive) setStatus(jobRunning ? `${job.reason || '签到'}任务执行中…` : job.error ? `任务失败：${job.error}` : job.finished_at ? '任务已完成' : '空闲', !!job.error); absorbLogs(job.logs, replace); showResults(job.results); }
     function reloginMessage(data) { if (data.state === 'opening') return '正在打开登录页并发送验证码…'; if (data.state === 'awaiting_code') return data.error || '验证码已发出，请输入后确认登录'; if (data.state === 'submitting') return '正在提交验证码…'; if (data.state === 'success') return '登录成功，Cookie 和该账号的独立缓存已保存。可以单独签到。'; if (data.state === 'failed') return data.error || '重新登录失败，原来的 Cookie 未改动'; return ''; }
     function createReloginPanel() {
@@ -303,7 +306,8 @@
     async function runOne(id) { try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(id)}/run`, {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     async function sendRelogin(card) { if (!card || taskBusy()) return; openRelogin(card); const email = card.querySelector('[data-field="email"]').value.trim(); const origin = sharedLoginOrigin(); noteLog(`开始重新登录 ${email || '（未填写邮箱）'}`); try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(card.dataset.id)}/relogin`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, origin})}); await poll(); } catch (error) { noteLog(error.message, 'ERROR'); setStatus(error.message, true); } }
     async function confirmRelogin(card) { if (!card) return; try { const body = await request('/api/relogin/code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code:card.querySelector('[data-relogin-code]').value.trim()})}); patchAccount(card.dataset.id, {cookie:body.cookie, origin:body.origin, email:body.email}); card.dataset.cache = 'ready'; updateCardSummary(card, accountResults.get(card.dataset.id)); card.querySelector('[data-relogin-code]').value = ''; setStatus('重新登录成功，该账号的 Cookie 和独立缓存已保存'); await poll(); } catch (error) { setStatus(error.message, true); await poll(); } }
-    async function cancelRelogin() { try { await request('/api/relogin/cancel', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
+    async function cancelRelogin() { try { noteLog('正在退出当前登录或签到'); await request('/api/stop', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
+    $('stop').onclick = () => cancelRelogin();
     function setBrowserMode(mode) { $('mode-headed').classList.toggle('active', mode === 'headed-xvfb'); $('mode-headless').classList.toggle('active', mode === 'headless'); }
     $('mode-headed').onclick = () => setBrowserMode('headed-xvfb'); $('mode-headless').onclick = () => setBrowserMode('headless');
     async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || 'glados.cloud'; const sharedOrigin = (config.accounts || []).map(item => String(item.origin || '').trim()).find(Boolean) || 'glados.cloud'; $('login-origin').value = sharedOrigin; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }

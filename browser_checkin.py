@@ -6,7 +6,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from browser_env import BrowserEnvironment, BrowserEnvironmentError, BrowserResponse, proxy_label
 from glados import (
@@ -41,12 +41,13 @@ class AccountRunMeta:
 class BrowserAPI:
     """A GLaDOS API facade whose requests always originate from the browser page."""
 
-    def __init__(self, environment: BrowserEnvironment, domain: str, entry: CookieEntry, verbose: bool = False, security_method: int = 0):
+    def __init__(self, environment: BrowserEnvironment, domain: str, entry: CookieEntry, verbose: bool = False, security_method: int = 0, cancelled: Callable[[], bool] | None = None):
         self.environment = environment
         self.domain = domain
         self.entry = entry
         self.verbose = verbose
         self.security_method = security_method
+        self.cancelled = cancelled
 
     def log(self, emoji: str, message: str, force: bool = False) -> None:
         self.entry.log(self.domain, emoji, message, self.verbose or force)
@@ -117,10 +118,13 @@ class BrowserAPI:
                     button.click(timeout=15_000, force=True)
 
             self.log(LogEmoji.INFO, "在当前桌面浏览器里点击画面上的 Security，并轮询等待通过", True)
+            if self.cancelled is not None and self.cancelled():
+                raise VerificationError("已退出")
             token = wait_for_turnstile(
                 page,
                 timeout=40,
                 log=lambda message: self.log(LogEmoji.INFO, message, True),
+                cancelled=self.cancelled,
             )
             self.log(LogEmoji.CHECKIN, f"Security 已通过（token 长度 {len(token)}），点击 Check-in")
             click_checkin()
@@ -181,12 +185,13 @@ class BrowserAPI:
 class BrowserCheckinRunner:
     """Sequentially run one disposable native Chromium environment per account."""
 
-    def __init__(self, config: Config, proxies: Iterable[str] = (), account_meta: dict[str, AccountRunMeta] | None = None, headless: bool = True):
+    def __init__(self, config: Config, proxies: Iterable[str] = (), account_meta: dict[str, AccountRunMeta] | None = None, headless: bool = True, cancelled: Callable[[], bool] | None = None):
         self.config = config
         self.headless = bool(headless)
         self.proxies = list(proxies)
         self.account_meta = account_meta or {}
         self.runtime: dict[str, dict[str, str]] = {}
+        self.cancelled = cancelled
 
     def run(self, account_ids: set[str] | None = None, budget: RunBudget | None = None) -> Report:
         entries = list(self.config.accounts)
@@ -199,7 +204,12 @@ class BrowserCheckinRunner:
                 selected.append((index, entry, meta))
 
         for position, (index, entry, meta) in enumerate(selected):
-            if position and not self._wait_between_accounts(entry, budget):
+            if self.cancelled is not None and self.cancelled():
+                entry.result = CheckinResult.failure(entry.origin or UNPROBED)
+                entry.result.note = "已退出"
+                entry._log_result()
+                break
+            if position and not self._wait_between_accounts(entry, budget, self.cancelled):
                 entry.result = CheckinResult.failure(entry.origin or UNPROBED)
                 entry.result.note = "运行超时，已跳过"
                 continue
@@ -211,16 +221,16 @@ class BrowserCheckinRunner:
         return Report(entries)
 
     @staticmethod
-    def _wait_between_accounts(entry: CookieEntry, budget: RunBudget) -> bool:
+    def _wait_between_accounts(entry: CookieEntry, budget: RunBudget, cancelled: Callable[[], bool] | None = None) -> bool:
         """Use a small random gap between accounts without exceeding the job budget."""
         seconds = random.randint(10, 20)
         entry.log(entry.origin or UNPROBED, LogEmoji.INFO, f"账号间隔等待 {seconds} 秒后继续", True)
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            if budget.expired():
+            if budget.expired() or (cancelled is not None and cancelled()):
                 return False
             time.sleep(min(0.5, deadline - time.monotonic()))
-        return not budget.expired()
+        return not budget.expired() and not (cancelled is not None and cancelled())
 
     def _candidate_proxies(self, meta: AccountRunMeta, index: int) -> list[str]:
         if meta.proxy:
@@ -234,6 +244,8 @@ class BrowserCheckinRunner:
         proxies = self._candidate_proxies(meta, index)
         last_error = ""
         for attempt, proxy in enumerate(proxies, 1):
+            if self.cancelled is not None and self.cancelled():
+                raise VerificationError("已退出")
             try:
                 entry.log(
                     entry.origin or UNPROBED,
@@ -273,7 +285,7 @@ class BrowserCheckinRunner:
                 entry.result = CheckinResult(domain=domain, days=days)
                 entry.result.note = "运行超时，已跳过签到"
             else:
-                api = BrowserAPI(environment, domain, entry, self.config.verbose)
+                api = BrowserAPI(environment, domain, entry, self.config.verbose, cancelled=self.cancelled)
                 entry.result = entry._sign_in(api, domain, days, self.config)
                 if entry.result is not None and entry.result.code in (0, 1):
                     try:
