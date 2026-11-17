@@ -19,7 +19,7 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
 from browser_checkin import AccountRunMeta, BrowserCheckinRunner
-from browser_env import BrowserEnvironmentError, normalize_proxy, parse_proxy_lines
+from browser_env import BrowserEnvironmentError, parse_proxy_lines
 from browser_state import cache_ready, ensure_account_states, state_dir
 from browser_login import (
     CODE_WAIT_SECONDS,
@@ -71,7 +71,7 @@ def _normalize_email(value: str) -> str:
 
 def _normalize_origin(value: str) -> str:
     text = re.sub(r"^https?://", "", str(value or "").strip(), flags=re.IGNORECASE)
-    host = text.split("/")[0].strip().lower()
+    host = text.split("/")[0].strip().lower() or "glados.cloud"
     if not _HOST.fullmatch(host):
         raise ValueError("请填写登录域名")
     return host
@@ -305,7 +305,7 @@ class JobManager:
             account_meta = {
                 str(index): AccountRunMeta(
                     account_id=item["id"],
-                    proxy=item.get("proxy", ""),
+                    proxy="",
                     state_dir=str(state_dir(self.store.data_dir, item["id"])),
                 )
                 for index, item in enumerate(selected, 1)
@@ -581,9 +581,7 @@ class LoginManager:
             self._attempt_event.set()
 
     def _proxies(self, account: dict[str, Any]) -> list[str]:
-        dedicated = str(account.get("proxy") or "").strip()
-        if dedicated:
-            return [normalize_proxy(dedicated)]
+        del account
         config = self.store.load()
         proxies = parse_proxy_lines(config.get("proxies_text", ""))
         return proxies or [""]

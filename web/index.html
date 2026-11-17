@@ -74,16 +74,17 @@
       <label for="base-urls">自定义 GLaDOS 域名（可选，逗号或分号分隔）</label><input id="base-urls" type="text" value="glados.cloud" placeholder="glados.cloud" />
       <label for="proxies">公共代理池（每行一条；未给账号指定代理时轮换使用）</label>
       <textarea id="proxies" placeholder="http://user:password@host:port"></textarea>
-      <div class="hint">单个账号可在账号卡中填专属代理；否则按公共代理池轮换。代理失败不会回退到云服务器直连。原生 Chromium 支持 HTTP(S) 代理及无认证 socks5:// 代理。</div>
+      <div class="hint">所有账号按公共代理池轮换。代理失败不会回退到云服务器直连。原生 Chromium 支持 HTTP(S) 代理及无认证 socks5:// 代理。</div>
     </section>
 
     <section>
       <div class="row" style="justify-content:space-between"><div><h2>账号 Cookie</h2><div class="muted">每张卡是独立签到环境。Cookie 仅保存在服务器私有数据目录中。</div></div><div class="actions"><button id="collapse-all" class="ghost" type="button">全部收起</button><button id="expand-all" class="ghost" type="button">全部展开</button><button id="import-toggle" class="ghost" type="button">批量导入 Cookie</button><button id="add-account" class="ghost" type="button">＋ 添加账号</button></div></div>
+      <label for="login-origin">登录域名（可选）</label><input id="login-origin" type="text" value="glados.cloud" placeholder="glados.cloud" />
       <div id="import-panel" class="hint" hidden>
         <label for="import-cookies">批量 Cookie（支持 JSON 数组 / 单个 JSON 对象，或旧版 <code>cookie1&amp;cookie2</code> 格式）</label>
         <textarea id="import-cookies" class="cookie" placeholder='[{"name":"主号","origin":"glados.cloud","cookie":"gld:sess=...","user-agent":"Mozilla/5.0 ..."}]'></textarea>
         <div class="row" style="margin-top:8px"><button id="import-accounts" type="button">导入到账号列表</button><button id="import-cancel" class="ghost" type="button">取消</button><span id="import-result" class="muted"></span></div>
-        <div class="muted" style="margin-top:7px">重复的完整 Cookie 会跳过，已有账号及其名称、域名、代理和未保存修改均保留。导入后请点击“保存配置”持久化。</div>
+        <div class="muted" style="margin-top:7px">重复的完整 Cookie 会跳过，已有账号及其名称和未保存修改均保留。导入后请点击“保存配置”持久化。</div>
       </div>
       <div id="accounts" class="account-list" style="margin-top:12px"></div>
     </section>
@@ -130,6 +131,7 @@
 
     function newId() { return crypto.randomUUID ? crypto.randomUUID() : `account-${Date.now()}-${Math.random().toString(16).slice(2)}`; }
     function newAccount() { return {id:newId(), enabled:true, name:'', email:'', origin:'', cookie:'', user_agent:'', proxy:''}; }
+    function sharedLoginOrigin() { const value = ($('login-origin').value || '').trim(); return value || 'glados.cloud'; }
     function input(type, value = '') { const el = document.createElement('input'); el.type = type; el.value = value || ''; return el; }
     function field(labelText, control, wide = false) { const box = document.createElement('div'); if (wide) box.className = 'wide'; const label = document.createElement('label'); label.textContent = labelText; box.append(label, control); return box; }
 
@@ -157,11 +159,9 @@
       const grid = document.createElement('div'); grid.className = 'card-grid';
       const name = input('text', account.name); name.placeholder = '备注名，例如主号'; name.dataset.field = 'name'; name.addEventListener('input', () => nameHead.textContent = name.value.trim() || '未命名账号');
       const email = input('text', account.email); email.placeholder = '重新登录时使用的邮箱'; email.dataset.field = 'email'; email.autocomplete = 'off';
-      const origin = input('text', account.origin); origin.placeholder = 'glados.cloud（不填自动探测）'; origin.dataset.field = 'origin';
-      const proxy = input('text', account.proxy); proxy.placeholder = '留空使用公共代理池'; proxy.dataset.field = 'proxy';
       const cookie = document.createElement('textarea'); cookie.className = 'cookie'; cookie.placeholder = '粘贴完整 Cookie，必须包含 gld:sess= 或 koa:sess='; cookie.value = account.cookie || ''; cookie.dataset.field = 'cookie';
       const ua = document.createElement('textarea'); ua.className = 'user-agent'; ua.placeholder = '可选：填写获取此 Cookie 时的浏览器 UA；仅覆盖请求 UA，不模拟完整设备指纹'; ua.value = account.user_agent || ''; ua.dataset.field = 'user_agent';
-      grid.append(field('账号名称', name), field('登录邮箱（重新登录）', email), field('登录域名（可选）', origin), field('专属代理（可选）', proxy), field('Cookie', cookie, true), field('User-Agent（可选）', ua, true));
+      grid.append(field('账号名称', name), field('登录邮箱（重新登录）', email), field('Cookie', cookie, true), field('User-Agent（可选）', ua, true));
       details.append(grid, createReloginPanel());
       const result = document.createElement('div'); result.className = 'result'; result.dataset.result = ''; details.append(result); card.append(details);
       showAccountResult(card, accountResults.get(account.id));
@@ -171,8 +171,7 @@
 
     function renderAccounts(accounts) { const root = $('accounts'); root.textContent = ''; (accounts.length ? accounts : [newAccount()]).forEach((account, i) => root.append(createAccountCard(account, i + 1))); }
     function renumber() { [...document.querySelectorAll('.account-card')].forEach((card, i) => card.querySelector('.account-index').textContent = `账号 ${i + 1}`); }
-    function collectAccounts() { return [...document.querySelectorAll('.account-card')].map(card => { const value = {id:card.dataset.id}; card.querySelectorAll('[data-field]').forEach(el => value[el.dataset.field] = el.type === 'checkbox' ? el.checked : el.value.trim()); return value; }); }
-    function normalizeImportedOrigin(value) { return String(value || '').trim().replace(/^https?:\/\//i, '').split('/')[0].toLowerCase(); }
+    function collectAccounts() { const origin = sharedLoginOrigin(); return [...document.querySelectorAll('.account-card')].map(card => { const value = {id:card.dataset.id, origin, proxy:''}; card.querySelectorAll('[data-field]').forEach(el => value[el.dataset.field] = el.type === 'checkbox' ? el.checked : el.value.trim()); return value; }); }
     function accountFromImport(item) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('JSON 中每个账号必须是对象');
       const cookie = String(item.cookie || '').trim();
@@ -181,7 +180,7 @@
       const canonicalUa = item.user_agent == null ? '' : String(item.user_agent).trim();
       const legacyUa = item['user-agent'] == null ? '' : String(item['user-agent']).trim();
       if (canonicalUa && legacyUa && canonicalUa !== legacyUa) throw new Error('同一 JSON 账号的 user_agent 与 user-agent 不一致');
-      return {...newAccount(), enabled:item.enabled !== false, name:String(item.name || '').trim(), email:String(item.email || '').trim(), origin:normalizeImportedOrigin(item.origin), cookie, user_agent:canonicalUa || legacyUa, proxy:String(item.proxy || '').trim()};
+      return {...newAccount(), enabled:item.enabled !== false, name:String(item.name || '').trim(), email:String(item.email || '').trim(), origin:sharedLoginOrigin(), cookie, user_agent:canonicalUa || legacyUa, proxy:''};
     }
     function parseImportedAccounts(raw) {
       const text = String(raw || '').replace(/^﻿/, '').trim();
@@ -302,12 +301,12 @@
     async function runAll() { try { await saveConfig(true); await request('/api/run', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     async function retryFailed() { try { await saveConfig(true); const body = await request('/api/run-failed', {method:'POST'}); setStatus(`开始重试 ${body.count} 个失败账号…`); await poll(); } catch (error) { setStatus(error.message, true); } }
     async function runOne(id) { try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(id)}/run`, {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
-    async function sendRelogin(card) { if (!card || taskBusy()) return; openRelogin(card); const email = card.querySelector('[data-field="email"]').value.trim(); noteLog(`开始重新登录 ${email || '（未填写邮箱）'}`); try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(card.dataset.id)}/relogin`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, origin:card.querySelector('[data-field="origin"]').value.trim()})}); await poll(); } catch (error) { noteLog(error.message, 'ERROR'); setStatus(error.message, true); } }
+    async function sendRelogin(card) { if (!card || taskBusy()) return; openRelogin(card); const email = card.querySelector('[data-field="email"]').value.trim(); const origin = sharedLoginOrigin(); noteLog(`开始重新登录 ${email || '（未填写邮箱）'}`); try { await saveConfig(true); await request(`/api/accounts/${encodeURIComponent(card.dataset.id)}/relogin`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email, origin})}); await poll(); } catch (error) { noteLog(error.message, 'ERROR'); setStatus(error.message, true); } }
     async function confirmRelogin(card) { if (!card) return; try { const body = await request('/api/relogin/code', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code:card.querySelector('[data-relogin-code]').value.trim()})}); patchAccount(card.dataset.id, {cookie:body.cookie, origin:body.origin, email:body.email}); card.dataset.cache = 'ready'; updateCardSummary(card, accountResults.get(card.dataset.id)); card.querySelector('[data-relogin-code]').value = ''; setStatus('重新登录成功，该账号的 Cookie 和独立缓存已保存'); await poll(); } catch (error) { setStatus(error.message, true); await poll(); } }
     async function cancelRelogin() { try { await request('/api/relogin/cancel', {method:'POST'}); await poll(); } catch (error) { setStatus(error.message, true); } }
     function setBrowserMode(mode) { $('mode-headed').classList.toggle('active', mode === 'headed-xvfb'); $('mode-headless').classList.toggle('active', mode === 'headless'); }
     $('mode-headed').onclick = () => setBrowserMode('headed-xvfb'); $('mode-headless').onclick = () => setBrowserMode('headless');
-    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || 'glados.cloud'; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
+    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || 'glados.cloud'; const sharedOrigin = (config.accounts || []).map(item => String(item.origin || '').trim()).find(Boolean) || 'glados.cloud'; $('login-origin').value = sharedOrigin; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
     $('add-account').addEventListener('click', () => { const root = $('accounts'); root.append(createAccountCard(newAccount(), root.children.length + 1)); });
     $('collapse-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, true));
     $('expand-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, false));

@@ -130,7 +130,7 @@ class ConfigStore:
             "enabled": bool(item.get("enabled", True)),
             "name": str(item.get("name") or "").strip(),
             "email": str(item.get("email") or "").strip(),
-            "origin": str(item.get("origin") or "").strip(),
+            "origin": str(item.get("origin") or "glados.cloud").strip(),
             "cookie": str(item.get("cookie") or "").strip(),
             "user_agent": " ".join(str(item.get("user_agent") or item.get("user-agent") or "").split()),
             "proxy": str(item.get("proxy") or "").strip(),
