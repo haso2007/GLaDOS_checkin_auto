@@ -15,7 +15,7 @@
     .actions,.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
     main { max-width:1420px; margin:auto; display:grid; grid-template-columns:minmax(360px, .9fr) minmax(480px, 1.4fr); gap:16px; padding:16px; }
     .full { grid-column:1 / -1; } section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:15px; }
-    label { display:block; margin:10px 0 4px; color:var(--muted); font-size:12px; } input,textarea { width:100%; color:var(--text); background:#0e130d; border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
+    label { display:block; margin:10px 0 4px; color:var(--muted); font-size:12px; } input,textarea,select { width:100%; color:var(--text); background:#0e130d; border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
     textarea { min-height:92px; resize:vertical; font-family:ui-monospace,Consolas,monospace; font-size:12px; }
     input:focus,textarea:focus { outline:2px solid rgba(201,238,105,.3); border-color:var(--green); }
     button { color:#17200d; background:var(--green); border:0; border-radius:8px; padding:8px 12px; font-weight:700; cursor:pointer; } button:hover { filter:brightness(1.08); } button:disabled { opacity:.55; cursor:not-allowed; }
@@ -74,9 +74,9 @@
       <label class="switch"><input id="auto-exchange" type="checkbox" checked /> 到期自动兑换积分</label>
       <label for="exchange-days">触发兑换的剩余天数</label><input id="exchange-days" type="number" min="0" step="0.5" value="1" />
       <label for="base-urls">自定义 GLaDOS 域名（可选，逗号或分号分隔）</label><input id="base-urls" type="text" value="glados.cloud" placeholder="glados.cloud" />
-      <label for="proxies">公共代理池（每行一条；未给账号指定代理时轮换使用）</label>
-      <textarea id="proxies" placeholder="http://user:password@host:port"></textarea>
-      <div class="hint">所有账号按公共代理池轮换。代理失败不会回退到云服务器直连。支持 HTTP(S) 代理，以及带认证或不带认证的 socks5:// 代理。</div>
+      <div class="row" style="justify-content:space-between;align-items:center;margin-top:10px"><label for="proxy-mode" style="margin:0">公共代理池</label><select id="proxy-mode" style="width:160px"><option value="direct">直连</option><option value="pool">代理池</option></select></div>
+      <textarea id="proxies" placeholder="http://user:password@host:port&#10;socks5://user:password@host:port"></textarea>
+      <div class="hint">每行一条。选择代理池时，所有账号按列表轮换，代理失败不会回退到云服务器直连。选择直连时不使用下面的列表。支持 HTTP(S) 代理，以及带认证或不带认证的 socks5:// 代理。</div>
     </section>
 
     <section>
@@ -154,8 +154,8 @@
       titleRow.append(enabled, index, nameHead, cacheBadge);
       title.append(titleRow, summary); head.append(title);
       const buttons = document.createElement('div'); buttons.className = 'actions';
-      const run = document.createElement('button'); run.type = 'button'; run.className = 'ghost small'; run.dataset.action = 'checkin'; run.textContent = '单独签到'; run.addEventListener('click', () => runOne(account.id));
-      const relogin = document.createElement('button'); relogin.type = 'button'; relogin.className = 'ghost small'; relogin.dataset.action = 'relogin'; relogin.textContent = '重新登录'; relogin.addEventListener('click', (event) => { event.stopPropagation(); sendRelogin(card); });
+      const run = document.createElement('button'); run.type = 'button'; run.className = 'small'; run.dataset.action = 'checkin'; run.textContent = '单独签到'; run.addEventListener('click', () => runOne(account.id));
+      const relogin = document.createElement('button'); relogin.type = 'button'; relogin.className = 'danger small'; relogin.dataset.action = 'relogin'; relogin.textContent = '重新登录'; relogin.addEventListener('click', (event) => { event.stopPropagation(); sendRelogin(card); });
       const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger small'; remove.textContent = '删除'; remove.addEventListener('click', () => { card.remove(); renumber(); });
       buttons.append(run, relogin, remove); head.append(buttons); card.append(head);
       title.addEventListener('click', event => { if (!event.target.closest('input,button')) setCardCollapsed(card, !card.classList.contains('collapsed')); });
@@ -220,7 +220,7 @@
       result.style.color = added.length ? 'var(--green2)' : 'var(--yellow)';
     }
     function browserMode() { return $('mode-headless').classList.contains('active') ? 'headless' : 'headed-xvfb'; }
-    function collectConfig() { return {accounts:collectAccounts(), proxies_text:$('proxies').value, auto_exchange:$('auto-exchange').checked, auto_exchange_left_days:$('exchange-days').value, verbose:false, browser_mode:browserMode(), base_urls:$('base-urls').value, scheduler:{enabled:$('schedule-enabled').checked, time:$('schedule-time').value || '01:10', timezone:'Asia/Shanghai'}}; }
+    function collectConfig() { return {accounts:collectAccounts(), proxies_text:$('proxies').value, proxy_mode:$('proxy-mode').value === 'pool' ? 'pool' : 'direct', auto_exchange:$('auto-exchange').checked, auto_exchange_left_days:$('exchange-days').value, verbose:false, browser_mode:browserMode(), base_urls:$('base-urls').value, scheduler:{enabled:$('schedule-enabled').checked, time:$('schedule-time').value || '01:10', timezone:'Asia/Shanghai'}}; }
 
     async function request(url, options = {}) { const res = await fetch(url, options); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.detail || `请求失败 (${res.status})`); return body; }
     function setStatus(text, error = false) { const node = $('status'); node.textContent = text; node.style.color = error ? 'var(--red)' : ''; }
@@ -311,7 +311,7 @@
     $('stop').onclick = () => cancelRelogin();
     function setBrowserMode(mode) { $('mode-headed').classList.toggle('active', mode === 'headed-xvfb'); $('mode-headless').classList.toggle('active', mode === 'headless'); }
     $('mode-headed').onclick = () => setBrowserMode('headed-xvfb'); $('mode-headless').onclick = () => setBrowserMode('headless');
-    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || 'glados.cloud'; const sharedOrigin = (config.accounts || []).map(item => String(item.origin || '').trim()).find(Boolean) || 'glados.cloud'; $('login-origin').value = sharedOrigin; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
+    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('proxy-mode').value = config.proxy_mode === 'pool' ? 'pool' : 'direct'; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || 'glados.cloud'; const sharedOrigin = (config.accounts || []).map(item => String(item.origin || '').trim()).find(Boolean) || 'glados.cloud'; $('login-origin').value = sharedOrigin; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
     $('add-account').addEventListener('click', () => { const root = $('accounts'); root.append(createAccountCard(newAccount(), root.children.length + 1)); });
     $('collapse-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, true));
     $('expand-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, false));
