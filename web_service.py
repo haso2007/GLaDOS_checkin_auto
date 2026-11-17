@@ -20,6 +20,13 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from browser_checkin import AccountRunMeta, BrowserCheckinRunner
 from browser_env import BrowserEnvironment, BrowserEnvironmentError, parse_proxy_lines
+
+
+def configured_proxies(config: dict[str, Any]) -> list[str]:
+    """Return the shared proxy pool, or none when the operator chose a direct connection."""
+    if str(config.get("proxy_mode") or "direct") != "pool":
+        return []
+    return parse_proxy_lines(config.get("proxies_text", ""))
 from browser_state import cache_ready, ensure_account_states, state_dir
 from browser_login import (
     CODE_WAIT_SECONDS,
@@ -324,7 +331,7 @@ class JobManager:
             }
             runner = BrowserCheckinRunner(
                 runtime,
-                proxies=parse_proxy_lines(config_data.get("proxies_text", "")),
+                proxies=configured_proxies(config_data),
                 account_meta=account_meta,
                 headless=config_data.get("browser_mode", "headless") == "headless",
                 cancelled=self._cancel.is_set,
@@ -603,8 +610,7 @@ class LoginManager:
     def _proxies(self, account: dict[str, Any]) -> list[str]:
         del account
         config = self.store.load()
-        proxies = parse_proxy_lines(config.get("proxies_text", ""))
-        return proxies or [""]
+        return configured_proxies(config) or [""]
 
     def _login_log(self, message: str) -> None:
         text = str(message or "").strip()
