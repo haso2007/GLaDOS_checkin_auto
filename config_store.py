@@ -17,6 +17,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "proxy_mode": "direct",
     "auto_exchange": True,
     "auto_exchange_left_days": 1,
+    "auto_retry": True,
+    "auto_retry_max": 2,
+    "auto_retry_delay_seconds": 120,
     "verbose": False,
     # Cloud deployments default to Chromium headless; headed-xvfb is for diagnostics.
     "browser_mode": "headless",
@@ -151,6 +154,15 @@ class ConfigStore:
             result["auto_exchange_left_days"] = max(0, float(source.get("auto_exchange_left_days", 1)))
         except (TypeError, ValueError):
             result["auto_exchange_left_days"] = 1
+        result["auto_retry"] = bool(source.get("auto_retry", True))
+        try:
+            result["auto_retry_max"] = max(0, min(5, int(source.get("auto_retry_max", 2))))
+        except (TypeError, ValueError):
+            result["auto_retry_max"] = 2
+        try:
+            result["auto_retry_delay_seconds"] = max(0, min(600, int(source.get("auto_retry_delay_seconds", 120))))
+        except (TypeError, ValueError):
+            result["auto_retry_delay_seconds"] = 120
         result["verbose"] = bool(source.get("verbose", False))
         mode = str(source.get("browser_mode") or "").strip()
         if mode not in {"headless", "headed-xvfb"}:
