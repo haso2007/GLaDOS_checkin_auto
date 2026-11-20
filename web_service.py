@@ -320,86 +320,33 @@ class JobManager:
             if not selected:
                 raise RuntimeError("所选账号的 Cookie 均无效")
 
-            # 自动重试只针对每天定时任务：首轮结束后仍有失败账号时，
-            # 只重试失败账号，最多 auto_retry_max 次，每次间隔
-            # auto_retry_delay_seconds 秒。手动签到仍用页面上的
-            # “重试失败账号”按钮手动触发。
-            auto_retry = reason == "定时" and bool(config_data.get("auto_retry", True))
-            try:
-                max_retries = max(0, min(5, int(config_data.get("auto_retry_max", 2))))
-            except (TypeError, ValueError):
-                max_retries = 2
-            try:
-                retry_delay = max(0, min(600, int(config_data.get("auto_retry_delay_seconds", 120))))
-            except (TypeError, ValueError):
-                retry_delay = 120
-            merged: dict[str, dict[str, Any]] = {}
-            order: list[str] = []
-            current = selected
-            attempt = 0
-            while True:
-                runtime = self._make_runtime_config(config_data, current)
-                account_meta = {
-                    str(index): AccountRunMeta(
-                        account_id=item["id"],
-                        proxy="",
-                        state_dir=str(state_dir(self.store.data_dir, item["id"])),
-                    )
-                    for index, item in enumerate(current, 1)
-                }
-                runner = BrowserCheckinRunner(
-                    runtime,
-                    proxies=configured_proxies(config_data),
-                    account_meta=account_meta,
-                    headless=config_data.get("browser_mode", "headless") == "headless",
-                    cancelled=self._cancel.is_set,
+            runtime = self._make_runtime_config(config_data, selected)
+            account_meta = {
+                str(index): AccountRunMeta(
+                    account_id=item["id"],
+                    proxy="",
+                    state_dir=str(state_dir(self.store.data_dir, item["id"])),
                 )
-                report = runner.run()
-                if self._cancel.is_set():
-                    logger.info("签到已退出")
-                logger.info("========== 签到总结 ==========")
-                logger.info("%s", report.title)
-                for line in report.render().splitlines():
-                    logger.info("%s", line)
-                for item in self._serialize_results(report.entries, current, runner.runtime):
-                    account_key = str(item.get("account_id") or "")
-                    if not account_key:
-                        continue
-                    if account_key not in merged:
-                        order.append(account_key)
-                    merged[account_key] = item
-                with self._lock:
-                    self._state["results"] = [merged[key] for key in order]
-                    self._persist_locked()
-                failed_ids = {
-                    key for key, item in merged.items() if item.get("status") == "failure"
-                }
-                if self._cancel.is_set() or not auto_retry or attempt >= max_retries or not failed_ids:
-                    break
-                attempt += 1
-                logger.info(
-                    "第 %d 次重试失败账号：%d 个（最多 %d 次），%d 秒后开始",
-                    attempt,
-                    len(failed_ids),
-                    max_retries,
-                    retry_delay,
-                )
-                if self._cancel.wait(retry_delay):
-                    logger.info("签到已退出")
-                    break
-                current = [item for item in selected if str(item.get("id") or "") in failed_ids]
-                if not current:
-                    break
-            if auto_retry and attempt:
-                succeeded = sum(
-                    1 for item in merged.values() if item.get("status") in {"success", "repeat"}
-                )
-                logger.info(
-                    "自动重试结束：共 %d 个账号，成功/重复 %d 个，失败 %d 个",
-                    len(merged),
-                    succeeded,
-                    len(merged) - succeeded,
-                )
+                for index, item in enumerate(selected, 1)
+            }
+            runner = BrowserCheckinRunner(
+                runtime,
+                proxies=configured_proxies(config_data),
+                account_meta=account_meta,
+                headless=config_data.get("browser_mode", "headless") == "headless",
+                cancelled=self._cancel.is_set,
+            )
+            report = runner.run()
+            if self._cancel.is_set():
+                logger.info("签到已退出")
+            logger.info("========== 签到总结 ==========")
+            logger.info("%s", report.title)
+            for line in report.render().splitlines():
+                logger.info("%s", line)
+            results = self._serialize_results(report.entries, selected, runner.runtime)
+            with self._lock:
+                self._state["results"] = results
+                self._persist_locked()
         except Exception as exc:  # noqa: BLE001
             logger.exception("任务失败：%s", exc)
             with self._lock:

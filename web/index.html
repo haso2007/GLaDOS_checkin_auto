@@ -62,10 +62,6 @@
         <input id="schedule-time" type="time" value="01:10" aria-label="自动签到时间" />
       </div>
       <div class="hint">按北京时间执行。定时任务运行时，手动签到按钮会暂时不可用。</div>
-      <label class="switch"><input id="auto-retry" type="checkbox" checked /> 定时签到失败时自动重试失败账号</label>
-      <label for="retry-max">最多重试次数（0–5）</label><input id="retry-max" type="number" min="0" max="5" step="1" value="2" />
-      <label for="retry-delay">重试间隔（秒，0–600）</label><input id="retry-delay" type="number" min="0" max="600" step="30" value="120" />
-      <div class="hint">只重试上一轮失败的账号；仍失败的继续进下一轮，最多重试上面填的次数。</div>
       <h2 style="margin-top:18px">浏览器模式</h2>
       <div class="filter-group">
         <button id="mode-headless" class="filter-btn active" type="button">无头</button>
@@ -224,7 +220,7 @@
       result.style.color = added.length ? 'var(--green2)' : 'var(--yellow)';
     }
     function browserMode() { return $('mode-headless').classList.contains('active') ? 'headless' : 'headed-xvfb'; }
-    function collectConfig() { return {accounts:collectAccounts(), proxies_text:$('proxies').value, proxy_mode:$('proxy-mode').value === 'pool' ? 'pool' : 'direct', auto_exchange:$('auto-exchange').checked, auto_exchange_left_days:$('exchange-days').value, auto_retry:$('auto-retry').checked, auto_retry_max:$('retry-max').value, auto_retry_delay_seconds:$('retry-delay').value, verbose:false, browser_mode:browserMode(), base_urls:$('base-urls').value, scheduler:{enabled:$('schedule-enabled').checked, time:$('schedule-time').value || '01:10', timezone:'Asia/Shanghai'}}; }
+    function collectConfig() { return {accounts:collectAccounts(), proxies_text:$('proxies').value, proxy_mode:$('proxy-mode').value === 'pool' ? 'pool' : 'direct', auto_exchange:$('auto-exchange').checked, auto_exchange_left_days:$('exchange-days').value, verbose:false, browser_mode:browserMode(), base_urls:$('base-urls').value, scheduler:{enabled:$('schedule-enabled').checked, time:$('schedule-time').value || '01:10', timezone:'Asia/Shanghai'}}; }
 
     async function request(url, options = {}) { const res = await fetch(url, options); const body = await res.json().catch(() => ({})); if (!res.ok) throw new Error(body.detail || `请求失败 (${res.status})`); return body; }
     function setStatus(text, error = false) { const node = $('status'); node.textContent = text; node.style.color = error ? 'var(--red)' : ''; }
@@ -315,7 +311,7 @@
     $('stop').onclick = () => cancelRelogin();
     function setBrowserMode(mode) { $('mode-headed').classList.toggle('active', mode === 'headed-xvfb'); $('mode-headless').classList.toggle('active', mode === 'headless'); }
     $('mode-headed').onclick = () => setBrowserMode('headed-xvfb'); $('mode-headless').onclick = () => setBrowserMode('headless');
-    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('proxy-mode').value = config.proxy_mode === 'pool' ? 'pool' : 'direct'; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || 'glados.cloud'; const sharedOrigin = (config.accounts || []).map(item => String(item.origin || '').trim()).find(Boolean) || 'glados.cloud'; $('login-origin').value = sharedOrigin; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; $('auto-retry').checked = config.auto_retry !== false; $('retry-max').value = config.auto_retry_max ?? 2; $('retry-delay').value = config.auto_retry_delay_seconds ?? 120; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
+    async function load() { try { const body = await request('/api/config'); config = body.config; $('proxies').value = config.proxies_text || ''; $('proxy-mode').value = config.proxy_mode === 'pool' ? 'pool' : 'direct'; $('auto-exchange').checked = config.auto_exchange !== false; $('exchange-days').value = config.auto_exchange_left_days ?? 1; $('base-urls').value = config.base_urls || 'glados.cloud'; const sharedOrigin = (config.accounts || []).map(item => String(item.origin || '').trim()).find(Boolean) || 'glados.cloud'; $('login-origin').value = sharedOrigin; setBrowserMode(config.browser_mode || 'headless'); $('schedule-enabled').checked = !!config.scheduler?.enabled; $('schedule-time').value = config.scheduler?.time || '01:10'; renderAccounts(config.accounts || []); await poll(); } catch (error) { setStatus(`加载失败：${error.message}`, true); } }
     $('add-account').addEventListener('click', () => { const root = $('accounts'); root.append(createAccountCard(newAccount(), root.children.length + 1)); });
     $('collapse-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, true));
     $('expand-all').onclick = () => document.querySelectorAll('.account-card').forEach(card => setCardCollapsed(card, false));
